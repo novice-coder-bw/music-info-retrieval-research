@@ -24,11 +24,21 @@ export default function UploadPanel() {
   const [dragActive, setDragActive] = useState(false);
   const [sessionMetadata, setSessionMetadata] = useState<SessionMetadata | null>(null);
 
+  const isContentTypeExtensionCompatible = useCallback((contentType: string, extension: string) => {
+    return (
+      (extension === '.wav' && ['audio/wav', 'audio/x-wav'].includes(contentType)) ||
+      (extension === '.mp3' && ['audio/mpeg', 'audio/mp3'].includes(contentType))
+    );
+  }, []);
+
   const validateFile = useCallback((file: File) => {
     const typeOk = acceptedTypes.includes(file.type);
-    const extensionOk = acceptedExtensions.some((ext) => file.name.toLowerCase().endsWith(ext));
-    return typeOk || extensionOk;
-  }, []);
+    const extension = file.name.toLowerCase().includes('.')
+      ? file.name.toLowerCase().slice(file.name.lastIndexOf('.'))
+      : '';
+    const extensionOk = acceptedExtensions.includes(extension);
+    return typeOk && extensionOk && isContentTypeExtensionCompatible(file.type, extension);
+  }, [isContentTypeExtensionCompatible]);
 
   const clickFileInput = useCallback(() => {
     const input = document.getElementById('audio-upload') as HTMLInputElement | null;
@@ -57,6 +67,23 @@ export default function UploadPanel() {
     setUploadProgress(null);
     setSessionMetadata(null);
   }, [validateFile]);
+
+  const parseServerError = useCallback((responseText: string) => {
+    if (!responseText) {
+      return 'Server returned an empty error response.';
+    }
+
+    try {
+      const payload = JSON.parse(responseText);
+      if (payload?.message) {
+        return payload.detail ? `${payload.message} ${payload.detail}` : payload.message;
+      }
+    } catch {
+      // Ignore parse errors and fall back to raw text.
+    }
+
+    return responseText;
+  }, []);
 
   const uploadFile = useCallback(() => {
     if (!selectedFile) {
@@ -92,19 +119,20 @@ export default function UploadPanel() {
           setUploadStatus('Upload failed');
         }
       } else {
-        setError('Upload failed. ' + (xhr.responseText || ''));
+        const serverError = parseServerError(xhr.responseText);
+        setError(`Upload failed. ${serverError}`);
         setUploadStatus('Upload failed');
       }
     };
 
     xhr.onerror = () => {
-      setError('Upload failed due to network error.');
+      setError('Upload failed due to network error. Please check your connection and try again.');
       setUploadStatus('Upload failed');
     };
 
     setUploadStatus('Uploading...');
     xhr.send(formData);
-  }, [selectedFile]);
+  }, [selectedFile, parseServerError]);
 
   const handleDrop = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {

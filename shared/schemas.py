@@ -7,3 +7,9 @@ class UploadResponse(BaseModel):
     size: int
     artifact_url: str
     message: str
+
+
+class UploadErrorResponse(BaseModel):
+    error_code: str
+    message: str
+    detail: str | None = None
