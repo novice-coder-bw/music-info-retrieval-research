@@ -9,7 +9,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from shared.schemas import UploadResponse, UploadErrorResponse
+from shared.schemas import UploadResponse, UploadErrorResponse, WorkflowStageStatus
 
 app = FastAPI()
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / 'uploads'
@@ -50,8 +50,22 @@ async def validate_audio_header(file: UploadFile, extension: str) -> None:
         raise ValueError('Unsupported audio extension.')
 
 
-def error_response(error_code: str, message: str, detail: str | None = None) -> JSONResponse:
-    response = UploadErrorResponse(error_code=error_code, message=message, detail=detail)
+def error_response(
+    error_code: str,
+    message: str,
+    detail: str | None = None,
+    stage: str | None = None,
+    next_action: str | None = None,
+    workflow_stages: list[WorkflowStageStatus] | None = None,
+) -> JSONResponse:
+    response = UploadErrorResponse(
+        error_code=error_code,
+        message=message,
+        detail=detail,
+        stage=stage,
+        next_action=next_action,
+        workflow_stages=workflow_stages,
+    )
     return JSONResponse(status_code=400, content=response.model_dump())
 
 
@@ -63,6 +77,16 @@ async def upload_audio(file: UploadFile = File(...)):
             'unsupported_audio_format',
             'Unsupported file type. Only WAV and MP3 are accepted.',
             f'Content type {file.content_type} and extension {extension} are not both supported.',
+            stage='upload',
+            next_action='Choose a WAV or MP3 file and try again.',
+            workflow_stages=[
+                WorkflowStageStatus(
+                    stage='upload',
+                    status='failed',
+                    message='Upload failed because the selected file type is unsupported.',
+                    next_action='Choose a WAV or MP3 file and try again.',
+                )
+            ],
         )
 
     if not is_content_type_extension_compatible(file.content_type, extension):
@@ -70,6 +94,16 @@ async def upload_audio(file: UploadFile = File(...)):
             'mimetype_extension_mismatch',
             'Unsupported audio file type.',
             f'Expected file extension {extension} to match content type {file.content_type}.',
+            stage='upload',
+            next_action='Ensure the selected file extension matches the file type and retry.',
+            workflow_stages=[
+                WorkflowStageStatus(
+                    stage='upload',
+                    status='failed',
+                    message='Upload failed because the MIME type did not match the file extension.',
+                    next_action='Ensure the selected file extension matches the file type and retry.',
+                )
+            ],
         )
 
     try:
@@ -79,6 +113,16 @@ async def upload_audio(file: UploadFile = File(...)):
             'corrupt_audio',
             'Uploaded audio appears to be corrupt or invalid.',
             str(exc),
+            stage='upload',
+            next_action='Try another WAV or MP3 file or export the source again.',
+            workflow_stages=[
+                WorkflowStageStatus(
+                    stage='upload',
+                    status='failed',
+                    message='Upload failed because the audio file did not validate.',
+                    next_action='Try another WAV or MP3 file or export the source again.',
+                )
+            ],
         )
 
     file_id = str(uuid.uuid4())
@@ -97,5 +141,12 @@ async def upload_audio(file: UploadFile = File(...)):
         size=destination.stat().st_size,
         artifact_url=artifact_url,
         message='Upload received',
+        workflow_stages=[
+            WorkflowStageStatus(
+                stage='upload',
+                status='completed',
+                message='Upload completed successfully.',
+            )
+        ],
     )
     return JSONResponse(response.model_dump())

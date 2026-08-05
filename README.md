@@ -5,6 +5,7 @@ This repository contains a minimal scaffold for the Music Analysis Platform MVP.
 ## Frontend
 - `frontend/`: Next.js application shell
 - `frontend/components/UploadPanel.tsx`: initial drag-and-drop upload UI
+- `frontend/app/api/upload/route.ts`: proxy route forwarding frontend upload requests to the backend
 
 ## Backend
 - `backend/`: FastAPI app scaffold
@@ -31,3 +32,6 @@ This repository contains a minimal scaffold for the Music Analysis Platform MVP.
    - `pip install -r requirements.txt`
    - `uvicorn app.main:app --reload`
    *(If not activated, use `./venv/Scripts/python -m uvicorn app.main:app --reload`)*
+
+> When running locally, the frontend proxy route forwards `/api/upload` to the backend at `http://localhost:8000` by default.
+> If your backend runs on a different host or port, set `NEXT_PUBLIC_BACKEND_URL` before starting the frontend.
