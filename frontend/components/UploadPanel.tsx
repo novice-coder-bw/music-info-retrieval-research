@@ -5,6 +5,16 @@ import React, { useCallback, useMemo, useState } from 'react';
 const acceptedTypes = ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3'];
 const acceptedExtensions = ['.wav', '.mp3'];
 
+type AnalysisSummary = {
+  status: 'pending' | 'active' | 'completed' | 'failed';
+  bpm?: number | null;
+  key?: string | null;
+  structure?: string[] | null;
+  message?: string | null;
+  next_action?: string | null;
+  task_id?: string | null;
+};
+
 const stageDefinitions = [
   { key: 'upload', label: 'Upload' },
   { key: 'analysis', label: 'Analysis' },
@@ -69,6 +79,7 @@ export default function UploadPanel() {
   const [sessionMetadata, setSessionMetadata] = useState<SessionMetadata | null>(null);
   const [workflowStages, setWorkflowStages] = useState<WorkflowStage[]>(defaultWorkflowStages);
   const [workflowMessage, setWorkflowMessage] = useState('');
+  const [analysisSummary, setAnalysisSummary] = useState<AnalysisSummary | null>(null);
 
   const stageLabelMap = useMemo(
     () => stageDefinitions.reduce<Record<string, string>>((acc, stage) => {
@@ -108,6 +119,7 @@ export default function UploadPanel() {
   const resetWorkflow = useCallback(() => {
     setWorkflowStages(defaultWorkflowStages);
     setWorkflowMessage('');
+    setAnalysisSummary(null);
   }, []);
 
   const handleFile = useCallback(
@@ -218,7 +230,8 @@ export default function UploadPanel() {
             setStageStatus('upload', 'completed', 'Upload completed successfully.');
           }
 
-          setWorkflowMessage('Upload finished. Next steps are pending until analysis is available.');
+          setWorkflowMessage('Upload finished. Analysis is about to start.');
+          void triggerAnalysis(response.file_id, response.filename, response.artifact_url);
         } catch {
           const message = 'Upload failed: invalid response from server.';
           setError(message);
@@ -248,6 +261,60 @@ export default function UploadPanel() {
 
     xhr.send(formData);
   }, [selectedFile, parseServerError, setStageStatus]);
+
+  const triggerAnalysis = useCallback(async (fileId: string, filename: string, artifactUrl: string) => {
+    setStageStatus('analysis', 'active', 'Analyzing audio metadata.');
+    setWorkflowMessage('Analysis in progress. BPM, key, and structure will appear shortly.');
+    setAnalysisSummary({
+      status: 'active',
+      message: 'Analyzing audio metadata.',
+    });
+
+    try {
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ file_id: fileId, filename, artifact_url: artifactUrl }),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        setStageStatus('analysis', 'failed', payload?.message ?? 'Analysis failed.', payload?.next_action ?? 'Try again later.');
+        setWorkflowMessage(payload?.message ?? 'Analysis failed.');
+        setAnalysisSummary({
+          status: 'failed',
+          message: payload?.message ?? 'Analysis failed.',
+          next_action: payload?.next_action ?? 'Try again later.',
+        });
+        if (Array.isArray(payload.workflow_stages)) {
+          setWorkflowStages(buildWorkflowStagesFromResponse(payload.workflow_stages));
+        }
+        return;
+      }
+
+      setStageStatus('analysis', 'completed', payload.analysis?.message ?? 'Analysis completed successfully.');
+      setWorkflowMessage('Analysis completed. BPM, key, and structure are ready.');
+      setAnalysisSummary({
+        status: payload.analysis?.status ?? 'completed',
+        bpm: payload.analysis?.bpm ?? null,
+        key: payload.analysis?.key ?? null,
+        structure: payload.analysis?.structure ?? [],
+        message: payload.analysis?.message ?? null,
+        task_id: payload.analysis?.task_id ?? null,
+      });
+      if (Array.isArray(payload.workflow_stages)) {
+        setWorkflowStages(buildWorkflowStagesFromResponse(payload.workflow_stages));
+      }
+    } catch {
+      setStageStatus('analysis', 'failed', 'Analysis failed because the request could not be completed.', 'Retry the analysis step.');
+      setWorkflowMessage('Analysis failed. Please retry.');
+      setAnalysisSummary({
+        status: 'failed',
+        message: 'Analysis failed because the request could not be completed.',
+        next_action: 'Retry the analysis step.',
+      });
+    }
+  }, [setStageStatus]);
 
   const handleDrop = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
@@ -346,6 +413,63 @@ export default function UploadPanel() {
             {workflowStages.filter((stage) => stage.status === 'completed').length}/{workflowStages.length} completed
           </span>
         </div>
+        {analysisSummary && (
+          <div
+            aria-label="Analysis summary"
+            style={{ display: 'grid', gap: '0.75rem', padding: '0.9rem', borderRadius: 10, background: '#0f172a' }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <strong>Analysis Summary</strong>
+              <span
+                aria-label={`Analysis status: ${analysisSummary.status}`}
+                style={{
+                  fontSize: '0.8rem',
+                  padding: '0.2rem 0.55rem',
+                  borderRadius: 999,
+                  background:
+                    analysisSummary.status === 'completed'
+                      ? '#22c55e'
+                      : analysisSummary.status === 'active'
+                      ? '#38bdf8'
+                      : analysisSummary.status === 'failed'
+                      ? '#f97316'
+                      : '#334155',
+                  color: '#fff',
+                }}
+              >
+                {analysisSummary.status}
+              </span>
+            </div>
+            {analysisSummary.message && <p style={{ margin: 0, color: '#cbd5e1' }}>{analysisSummary.message}</p>}
+            <div style={{ display: 'grid', gap: '0.5rem', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))' }}>
+              <div aria-label="BPM summary card" style={{ padding: '0.65rem', borderRadius: 8, background: '#111827' }}>
+                <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>BPM</div>
+                <div style={{ fontSize: '1rem', fontWeight: 600 }}>
+                  {analysisSummary.status === 'active' ? '…' : analysisSummary.bpm ?? '—'}
+                </div>
+              </div>
+              <div aria-label="Key summary card" style={{ padding: '0.65rem', borderRadius: 8, background: '#111827' }}>
+                <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>Key</div>
+                <div style={{ fontSize: '1rem', fontWeight: 600 }}>
+                  {analysisSummary.status === 'active' ? '…' : analysisSummary.key ?? '—'}
+                </div>
+              </div>
+              <div aria-label="Structure summary card" style={{ padding: '0.65rem', borderRadius: 8, background: '#111827' }}>
+                <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>Structure</div>
+                <div style={{ fontSize: '1rem', fontWeight: 600 }}>
+                  {analysisSummary.status === 'active'
+                    ? '…'
+                    : analysisSummary.structure?.length
+                    ? analysisSummary.structure.join(', ')
+                    : '—'}
+                </div>
+              </div>
+            </div>
+            {analysisSummary.next_action && (
+              <p role="alert" style={{ margin: 0, color: '#f8b4b4', fontSize: '0.9rem' }}>{analysisSummary.next_action}</p>
+            )}
+          </div>
+        )}
         <div style={{ display: 'grid', gap: '0.5rem' }}>
           {workflowStages.map((stage) => (
             <div

@@ -23,6 +23,7 @@ out/
 frontend/.next/
 frontend/.turbo/
 frontend/node_modules/
+frontend/*.tsbuildinfo
 backend/uploads/
 
 # IDE/Editor
