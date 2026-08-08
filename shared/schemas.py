@@ -61,3 +61,40 @@ class AnalyzeErrorResponse(BaseModel):
     stage: str | None = None
     next_action: str | None = None
     workflow_stages: list[WorkflowStageStatus] | None = None
+
+
+class StemArtifact(BaseModel):
+    name: str
+    url: str
+    size: int | None = None
+    format: str | None = None
+    mime_type: str | None = None
+
+
+class StemsMetadata(BaseModel):
+    status: Literal['pending', 'active', 'completed', 'failed']
+    stems: list[StemArtifact] | None = None
+    task_id: str | None = None
+    method: str | None = None
+    message: str | None = None
+    next_action: str | None = None
+    separated_at: str | None = None
+
+
+class SeparateRequest(BaseModel):
+    file_id: str
+
+
+class SeparateResponse(BaseModel):
+    file_id: str
+    stems: StemsMetadata
+    workflow_stages: list[WorkflowStageStatus]
+
+
+class SeparateErrorResponse(BaseModel):
+    error_code: str
+    message: str
+    detail: str | None = None
+    stage: str | None = None
+    next_action: str | None = None
+    workflow_stages: list[WorkflowStageStatus] | None = None

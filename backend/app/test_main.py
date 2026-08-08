@@ -154,3 +154,110 @@ def test_analyze_audio_missing_artifact(tmp_path, monkeypatch):
     data = response.json()
     assert data['error_code'] == 'analysis_artifact_missing'
     assert main.SESSIONS[file_id]['analysis']['status'] == 'failed'
+def _seed_analyzed_session(tmp_path, monkeypatch, filename='analysis.wav'):
+    monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
+    monkeypatch.setattr(main, 'STEM_DIR', tmp_path / 'stems')
+    main.STEM_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = tmp_path / filename
+    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+    with file_path.open('rb') as file:
+        upload_response = client.post('/api/upload', files={'file': (filename, file, 'audio/wav')})
+    file_id = upload_response.json()['file_id']
+    client.post(
+        '/api/analyze',
+        json={
+            'file_id': file_id,
+            'filename': upload_response.json()['filename'],
+            'artifact_url': upload_response.json()['artifact_url'],
+        },
+    )
+    return file_id
+
+
+def test_separate_audio_success(tmp_path, monkeypatch):
+    file_id = _seed_analyzed_session(tmp_path, monkeypatch)
+
+    response = client.post('/api/separate', json={'file_id': file_id})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data['stems']['status'] == 'completed'
+    stem_names = [stem['name'] for stem in data['stems']['stems']]
+    assert stem_names == ['drums', 'bass', 'other', 'vocals']
+    for stem in data['stems']['stems']:
+        assert stem['url'].startswith('/uploads/stems/')
+
+    stages = data['workflow_stages']
+    assert stages[0]['stage'] == 'upload'
+    assert stages[0]['status'] == 'completed'
+    assert stages[1]['stage'] == 'analysis'
+    assert stages[2]['stage'] == 'stem_separation'
+    assert stages[2]['status'] == 'completed'
+
+    session = main.SESSIONS[file_id]
+    assert session['stems']['status'] == 'completed'
+    assert len(session['stems']['stems']) == 4
+    stem_dir = main.STEM_DIR / file_id
+    assert (stem_dir / 'drums.wav').exists()
+    assert (stem_dir / 'vocals.wav').exists()
+
+
+def test_separate_audio_missing_file_id():
+    response = client.post('/api/separate', json={'file_id': 'missing'})
+
+    assert response.status_code == 404
+    data = response.json()
+    assert data['error_code'] == 'separation_session_not_found'
+    assert data['stage'] == 'stem_separation'
+    assert data['next_action']
+
+
+def test_separate_audio_analysis_not_complete(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
+    file_path = tmp_path / 'raw.wav'
+    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+    with file_path.open('rb') as file:
+        upload_response = client.post('/api/upload', files={'file': ('raw.wav', file, 'audio/wav')})
+    file_id = upload_response.json()['file_id']
+
+    response = client.post('/api/separate', json={'file_id': file_id})
+
+    assert response.status_code == 422
+    data = response.json()
+    assert data['error_code'] == 'separation_analysis_not_complete'
+    assert main.SESSIONS[file_id].get('stems') is None
+
+
+def test_separate_audio_idempotent(tmp_path, monkeypatch):
+    file_id = _seed_analyzed_session(tmp_path, monkeypatch)
+
+    first = client.post('/api/separate', json={'file_id': file_id})
+    second = client.post('/api/separate', json={'file_id': file_id})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()['stems'] == second.json()['stems']
+
+
+def test_separate_audio_missing_artifact(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
+    file_id = 'missing-artifact-session'
+    main.SESSIONS[file_id] = {
+        'file_id': file_id,
+        'filename': 'missing.wav',
+        'artifact_url': '/uploads/missing.wav',
+        'analysis': {
+            'status': 'completed',
+            'bpm': 118.0,
+            'key': 'D minor',
+            'structure': ['intro', 'verse', 'chorus', 'outro'],
+        },
+        'workflow_stages': [],
+    }
+
+    response = client.post('/api/separate', json={'file_id': file_id})
+
+    assert response.status_code == 422
+    data = response.json()
+    assert data['error_code'] == 'separation_artifact_missing'
+    assert main.SESSIONS[file_id]['stems']['status'] == 'failed'

@@ -15,15 +15,27 @@ from shared.schemas import (
     AnalyzeRequest,
     AnalyzeResponse,
     AnalysisMetadata,
+    SeparateErrorResponse,
+    SeparateRequest,
+    SeparateResponse,
+    StemArtifact,
+    StemsMetadata,
     UploadResponse,
     UploadErrorResponse,
     WorkflowStageStatus,
 )
-from workers.tasks import analyze_audio as run_worker_analysis, analyze_audio_task
+from workers.tasks import (
+    analyze_audio as run_worker_analysis,
+    analyze_audio_task,
+    separate_stems as run_worker_separation,
+    separate_stems_task,
+)
 
 app = FastAPI()
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / 'uploads'
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+STEM_DIR = UPLOAD_DIR / 'stems'
+STEM_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount('/uploads', StaticFiles(directory=UPLOAD_DIR), name='uploads')
 
@@ -119,6 +131,79 @@ def run_analysis_task(file_id: str, file_path: str) -> dict:
         except Exception:
             pass
     return run_worker_analysis(file_id, file_path)
+
+
+def mime_for_extension(ext: str | None) -> str:
+    ext = (ext or '').lower()
+    if ext == 'wav':
+        return 'audio/wav'
+    if ext == 'mp3':
+        return 'audio/mpeg'
+    return 'audio/octet-stream'
+
+
+def build_stage_dicts(
+    analysis_status: str,
+    analysis_message: str,
+    separation_status: str | None = None,
+    separation_message: str | None = None,
+    separation_next_action: str | None = None,
+) -> list[dict]:
+    """Build the serialized workflow stage list for a session or response."""
+    stages: list[dict] = [
+        {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
+        {'stage': 'analysis', 'status': analysis_status, 'message': analysis_message},
+    ]
+    if separation_status is not None:
+        stage: dict = {
+            'stage': 'stem_separation',
+            'status': separation_status,
+            'message': separation_message,
+        }
+        if separation_next_action:
+            stage['next_action'] = separation_next_action
+        stages.append(stage)
+    return stages
+
+
+def workflow_stage_models(stages: list[dict]) -> list[WorkflowStageStatus]:
+    return [WorkflowStageStatus(**stage) for stage in stages]
+
+
+def build_separation_response(file_id: str, stems: StemsMetadata) -> dict:
+    """Build the separation response payload, preserving the upload/analysis stages."""
+    separation_status = stems.status if stems.status in {'active', 'failed'} else 'completed'
+    separation_message = stems.message or 'Stem separation completed successfully.'
+    if stems.status == 'failed':
+        separation_message = stems.message or 'Stem separation failed.'
+
+    analysis = (SESSIONS.get(file_id) or {}).get('analysis') or {}
+    analysis_status = analysis.get('status', 'completed')
+    analysis_message = analysis.get('message') or 'Analysis completed successfully.'
+
+    workflow_stages = build_stage_dicts(
+        analysis_status,
+        analysis_message,
+        separation_status,
+        separation_message,
+        stems.next_action,
+    )
+    return SeparateResponse(
+        file_id=file_id,
+        stems=stems,
+        workflow_stages=workflow_stage_models(workflow_stages),
+    ).model_dump()
+
+
+def run_separation_task(file_id: str, file_path: str, stems_dir) -> dict:
+    """Execute separation via Celery when available, otherwise run in-process."""
+    if separate_stems_task is not None:
+        try:
+            async_result = separate_stems_task.delay(file_id, file_path, str(stems_dir))
+            return async_result.get(timeout=30)
+        except Exception:
+            pass
+    return run_worker_separation(file_id, file_path, stems_dir)
 
 
 @app.post('/api/upload')
@@ -358,3 +443,135 @@ async def analyze_audio(payload: AnalyzeRequest):
     ]
 
     return JSONResponse(build_analyze_response(payload.file_id, completed_analysis))
+
+@app.post('/api/separate', response_model=SeparateResponse)
+async def separate_audio(payload: SeparateRequest):
+    session = SESSIONS.get(payload.file_id)
+    if not session:
+        stages = build_stage_dicts(
+            'pending',
+            'Analysis has not started yet.',
+            'failed',
+            'Separation could not start because the session was not found.',
+            'Upload the audio file again and try separation.',
+        )
+        return JSONResponse(
+            status_code=404,
+            content=SeparateErrorResponse(
+                error_code='separation_session_not_found',
+                message='Separation session was not found.',
+                detail='No upload session exists for the supplied file_id.',
+                stage='stem_separation',
+                next_action='Upload the audio file again and try separation.',
+                workflow_stages=workflow_stage_models(stages),
+            ).model_dump(),
+        )
+
+    existing_stems = session.get('stems')
+    if existing_stems and existing_stems.get('status') == 'completed':
+        return JSONResponse(build_separation_response(payload.file_id, StemsMetadata.model_validate(existing_stems)))
+
+    analysis = session.get('analysis') or {}
+    analysis_status = analysis.get('status', 'pending')
+    if analysis_status == 'completed':
+        analysis_message = analysis.get('message') or 'Analysis completed successfully.'
+    else:
+        analysis_message = analysis.get('message') or 'Analysis has not been completed yet.'
+
+    if analysis_status != 'completed':
+        separation_error = 'Stem separation cannot start because analysis is not complete.'
+        stages = build_stage_dicts(
+            analysis_status,
+            analysis_message,
+            'failed',
+            separation_error,
+            'Run audio analysis first, then retry stem separation.',
+        )
+        return JSONResponse(
+            status_code=422,
+            content=SeparateErrorResponse(
+                error_code='separation_analysis_not_complete',
+                message=separation_error,
+                detail='Analysis must be completed before separating stems.',
+                stage='stem_separation',
+                next_action='Run audio analysis first, then retry stem separation.',
+                workflow_stages=workflow_stage_models(stages),
+            ).model_dump(),
+        )
+
+    task_id = str(uuid.uuid4())
+    active_stems = StemsMetadata(status='active', message='Separating audio into stems.', task_id=task_id)
+    session['stems'] = active_stems.model_dump()
+    session['workflow_stages'] = build_stage_dicts(analysis_status, analysis_message, 'active', 'Separating audio into stems.')
+
+    file_path = UPLOAD_DIR / session['filename']
+    if not file_path.exists():
+        failed_stems = StemsMetadata(
+            status='failed',
+            task_id=task_id,
+            message='Stem separation failed because the uploaded artifact could not be found.',
+            next_action='Upload the audio file again and retry separation.',
+        )
+        session['stems'] = failed_stems.model_dump()
+        stages = build_stage_dicts(analysis_status, analysis_message, 'failed', failed_stems.message, failed_stems.next_action)
+        session['workflow_stages'] = stages
+        return JSONResponse(
+            status_code=422,
+            content=SeparateErrorResponse(
+                error_code='separation_artifact_missing',
+                message=failed_stems.message or 'Separation artifact missing.',
+                detail=f'Expected artifact at {file_path}.',
+                stage='stem_separation',
+                next_action=failed_stems.next_action,
+                workflow_stages=workflow_stage_models(stages),
+            ).model_dump(),
+        )
+
+    stems_dir = STEM_DIR / session['file_id']
+    try:
+        worker_result = run_separation_task(session['file_id'], str(file_path), stems_dir)
+    except Exception as exc:
+        failed_stems = StemsMetadata(
+            status='failed',
+            task_id=task_id,
+            message='Stem separation failed while processing the uploaded audio.',
+            next_action='Retry separation or upload a different WAV or MP3 file.',
+        )
+        session['stems'] = failed_stems.model_dump()
+        stages = build_stage_dicts(analysis_status, analysis_message, 'failed', failed_stems.message, failed_stems.next_action)
+        session['workflow_stages'] = stages
+        return JSONResponse(
+            status_code=500,
+            content=SeparateErrorResponse(
+                error_code='separation_processing_failed',
+                message=failed_stems.message or 'Stem separation failed.',
+                detail=str(exc),
+                stage='stem_separation',
+                next_action=failed_stems.next_action,
+                workflow_stages=workflow_stage_models(stages),
+            ).model_dump(),
+        )
+
+    stem_artifacts = [
+        StemArtifact(
+            name=stem['name'],
+            url=f"/uploads/stems/{session['file_id']}/{stem['filename']}",
+            size=stem.get('size'),
+            format=stem.get('format'),
+            mime_type=mime_for_extension(stem.get('format')),
+        )
+        for stem in worker_result['stems']
+    ]
+    completed_stems = StemsMetadata(
+        status='completed',
+        stems=stem_artifacts,
+        task_id=task_id,
+        method=worker_result.get('method'),
+        message='Stem separation completed successfully.',
+        separated_at=worker_result.get('separated_at') or datetime.now(timezone.utc).isoformat(),
+    )
+    session['stems'] = completed_stems.model_dump()
+    stages = build_stage_dicts(analysis_status, analysis_message, 'completed', 'Stem separation completed successfully.')
+    session['workflow_stages'] = stages
+
+    return JSONResponse(build_separation_response(session['file_id'], completed_stems))

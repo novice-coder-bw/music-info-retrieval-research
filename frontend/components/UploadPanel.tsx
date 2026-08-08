@@ -15,6 +15,23 @@ type AnalysisSummary = {
   task_id?: string | null;
 };
 
+type StemArtifact = {
+  name: string;
+  url: string;
+  size?: number | null;
+  format?: string | null;
+  mime_type?: string | null;
+};
+
+type StemsSummary = {
+  status: 'pending' | 'active' | 'completed' | 'failed';
+  stems?: StemArtifact[] | null;
+  task_id?: string | null;
+  method?: string | null;
+  message?: string | null;
+  next_action?: string | null;
+};
+
 const stageDefinitions = [
   { key: 'upload', label: 'Upload' },
   { key: 'analysis', label: 'Analysis' },
@@ -80,6 +97,7 @@ export default function UploadPanel() {
   const [workflowStages, setWorkflowStages] = useState<WorkflowStage[]>(defaultWorkflowStages);
   const [workflowMessage, setWorkflowMessage] = useState('');
   const [analysisSummary, setAnalysisSummary] = useState<AnalysisSummary | null>(null);
+  const [stemSeparation, setStemSeparation] = useState<StemsSummary | null>(null);
 
   const stageLabelMap = useMemo(
     () => stageDefinitions.reduce<Record<string, string>>((acc, stage) => {
@@ -120,6 +138,7 @@ export default function UploadPanel() {
     setWorkflowStages(defaultWorkflowStages);
     setWorkflowMessage('');
     setAnalysisSummary(null);
+    setStemSeparation(null);
   }, []);
 
   const handleFile = useCallback(
@@ -262,6 +281,56 @@ export default function UploadPanel() {
     xhr.send(formData);
   }, [selectedFile, parseServerError, setStageStatus]);
 
+  const triggerSeparation = useCallback(async (fileId: string) => {
+    setStageStatus('stem_separation', 'active', 'Separating audio into stems.');
+    setWorkflowMessage('Stem separation in progress. Stems will be ready shortly.');
+    setStemSeparation({ status: 'active', message: 'Separating audio into stems.' });
+
+    try {
+      const response = await fetch('/api/separate', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ file_id: fileId }),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        setStageStatus('stem_separation', 'failed', payload?.message ?? 'Stem separation failed.', payload?.next_action ?? 'Try again later.');
+        setWorkflowMessage(payload?.message ?? 'Stem separation failed.');
+        setStemSeparation({
+          status: 'failed',
+          message: payload?.message ?? 'Stem separation failed.',
+          next_action: payload?.next_action ?? 'Try again later.',
+        });
+        if (Array.isArray(payload.workflow_stages)) {
+          setWorkflowStages(buildWorkflowStagesFromResponse(payload.workflow_stages));
+        }
+        return;
+      }
+
+      setStageStatus('stem_separation', 'completed', payload.stems?.message ?? 'Stem separation completed successfully.');
+      setWorkflowMessage('Stem separation complete. Stems are ready for review.');
+      setStemSeparation({
+        status: payload.stems?.status ?? 'completed',
+        stems: payload.stems?.stems ?? [],
+        method: payload.stems?.method ?? null,
+        message: payload.stems?.message ?? null,
+        task_id: payload.stems?.task_id ?? null,
+      });
+      if (Array.isArray(payload.workflow_stages)) {
+        setWorkflowStages(buildWorkflowStagesFromResponse(payload.workflow_stages));
+      }
+    } catch {
+      setStageStatus('stem_separation', 'failed', 'Stem separation failed because the request could not be completed.', 'Retry the stem separation step.');
+      setWorkflowMessage('Stem separation failed. Please retry.');
+      setStemSeparation({
+        status: 'failed',
+        message: 'Stem separation failed because the request could not be completed.',
+        next_action: 'Retry the stem separation step.',
+      });
+    }
+  }, [setStageStatus]);
+
   const triggerAnalysis = useCallback(async (fileId: string, filename: string, artifactUrl: string) => {
     setStageStatus('analysis', 'active', 'Analyzing audio metadata.');
     setWorkflowMessage('Analysis in progress. BPM, key, and structure will appear shortly.');
@@ -305,6 +374,7 @@ export default function UploadPanel() {
       if (Array.isArray(payload.workflow_stages)) {
         setWorkflowStages(buildWorkflowStagesFromResponse(payload.workflow_stages));
       }
+      void triggerSeparation(fileId);
     } catch {
       setStageStatus('analysis', 'failed', 'Analysis failed because the request could not be completed.', 'Retry the analysis step.');
       setWorkflowMessage('Analysis failed. Please retry.');
@@ -314,7 +384,7 @@ export default function UploadPanel() {
         next_action: 'Retry the analysis step.',
       });
     }
-  }, [setStageStatus]);
+  }, [setStageStatus, triggerSeparation]);
 
   const handleDrop = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
@@ -467,6 +537,65 @@ export default function UploadPanel() {
             </div>
             {analysisSummary.next_action && (
               <p role="alert" style={{ margin: 0, color: '#f8b4b4', fontSize: '0.9rem' }}>{analysisSummary.next_action}</p>
+            )}
+          </div>
+        )}
+        {stemSeparation && (
+          <div
+            aria-label="Stem separation"
+            style={{ display: 'grid', gap: '0.75rem', padding: '0.9rem', borderRadius: 10, background: '#0f172a' }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <strong>Stem Separation</strong>
+              <span
+                aria-label={`Stem separation status: ${stemSeparation.status}`}
+                style={{
+                  fontSize: '0.8rem',
+                  padding: '0.2rem 0.55rem',
+                  borderRadius: 999,
+                  background:
+                    stemSeparation.status === 'completed'
+                      ? '#22c55e'
+                      : stemSeparation.status === 'active'
+                      ? '#38bdf8'
+                      : stemSeparation.status === 'failed'
+                      ? '#f97316'
+                      : '#334155',
+                  color: '#fff',
+                }}
+              >
+                {stemSeparation.status}
+              </span>
+            </div>
+            {stemSeparation.message && <p style={{ margin: 0, color: '#cbd5e1' }}>{stemSeparation.message}</p>}
+            {stemSeparation.status === 'completed' && (
+              <>
+                <p aria-label="Stems ready for review" style={{ margin: 0, color: '#a7f3d0', fontWeight: 600 }}>
+                  Stems are ready for review.
+                </p>
+                <ul
+                  aria-label="Stem list"
+                  style={{
+                    margin: 0,
+                    paddingLeft: '1rem',
+                    display: 'grid',
+                    gap: '0.3rem',
+                    listStyle: 'disc',
+                  }}
+                >
+                  {(stemSeparation.stems ?? []).map((stem) => (
+                    <li key={stem.name} style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', fontSize: '0.9rem' }}>
+                      <span>{stem.name}</span>
+                      <span style={{ color: '#94a3b8' }}>{stem.format ? stem.format.toUpperCase() : 'WAV'}</span>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {stemSeparation.next_action && (
+              <p role="alert" style={{ margin: 0, color: '#f8b4b4', fontSize: '0.9rem' }}>
+                {stemSeparation.next_action}
+              </p>
             )}
           </div>
         )}
