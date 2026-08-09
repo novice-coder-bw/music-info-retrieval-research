@@ -139,7 +139,7 @@ def test_analyze_audio_idempotent(tmp_path, monkeypatch):
 
 def test_analyze_audio_missing_artifact(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
-    file_id = 'missing-artifact-session'
+    file_id = 'analysis-missing-artifact-session'
     main.SESSIONS[file_id] = {
         'file_id': file_id,
         'filename': 'missing.wav',
@@ -241,7 +241,7 @@ def test_separate_audio_idempotent(tmp_path, monkeypatch):
 
 def test_separate_audio_missing_artifact(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
-    file_id = 'missing-artifact-session'
+    file_id = 'separation-missing-artifact-session'
     main.SESSIONS[file_id] = {
         'file_id': file_id,
         'filename': 'missing.wav',
@@ -261,3 +261,254 @@ def test_separate_audio_missing_artifact(tmp_path, monkeypatch):
     data = response.json()
     assert data['error_code'] == 'separation_artifact_missing'
     assert main.SESSIONS[file_id]['stems']['status'] == 'failed'
+# --- Story 2.3: persistence & object-storage test coverage -----------------
+# The durable store is exercised through the store adapter (not the in-memory
+# SESSIONS dict) so these tests prove the process-restart-survival contract.
+
+
+def _configure_persistent_store(tmp_path) -> str:
+    """Point the app store at a temp-file SQLite backend; return its URL."""
+    import db.engine as db_engine_module
+
+    db_url = f"sqlite:///{(tmp_path / 'persistence.db').as_posix()}"
+    db_engine_module.configure_engine(db_url)
+    return db_url
+
+
+def _restore_default_store() -> None:
+    import db.engine as db_engine_module
+
+    db_engine_module.reset_engine()
+
+
+def test_upload_persists_session_and_raw_audio_artifact(tmp_path, monkeypatch):
+    """Upload writes a session row + one raw_audio artifact to the store."""
+    from db import store as db_store
+
+    monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
+    file_path = tmp_path / 'persist.wav'
+    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+
+    with file_path.open('rb') as file:
+        response = client.post('/api/upload', files={'file': ('persist.wav', file, 'audio/wav')})
+
+    assert response.status_code == 200
+    file_id = response.json()['file_id']
+
+    stored = db_store.get_session(file_id)
+    assert stored is not None
+    assert stored['file_id'] == file_id
+    assert stored['analysis'] is None
+    assert stored['workflow_stages'][0]['status'] == 'completed'
+
+    artifacts = db_store.list_artifacts(file_id)
+    assert len(artifacts) == 1
+    assert artifacts[0]['kind'] == 'raw_audio'
+    assert artifacts[0]['storage_backend'] == 'local'
+    assert artifacts[0]['url'].startswith('/uploads/')
+
+
+def test_persistence_round_trip_survives_restart(tmp_path, monkeypatch):
+    """Full flow persists; a fresh engine on the same DB file restores it."""
+    from sqlalchemy.orm import sessionmaker
+
+    import db.engine as db_engine_module
+    from db import store as db_store
+    from db.models import Base
+
+    db_url = _configure_persistent_store(tmp_path)
+    try:
+        file_id = _seed_analyzed_session(tmp_path, monkeypatch)
+
+        separate_response = client.post('/api/separate', json={'file_id': file_id})
+        assert separate_response.status_code == 200
+
+        # Simulate a process restart: a brand-new engine bound to the same file,
+        # read through the store adapter (NOT the in-memory SESSIONS dict).
+        fresh_engine = db_engine_module.create_engine_for_url(db_url)
+        Base.metadata.create_all(fresh_engine)
+        fresh_factory = sessionmaker(bind=fresh_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+
+        stored = db_store.get_session(file_id, fresh_factory)
+        assert stored is not None
+        assert stored['analysis']['status'] == 'completed'
+        assert stored['analysis']['bpm'] > 0
+        assert stored['stems']['status'] == 'completed'
+        stem_names = [stem['name'] for stem in stored['stems']['stems']]
+        assert stem_names == ['drums', 'bass', 'other', 'vocals']
+        stage_status = {stage['stage']: stage['status'] for stage in stored['workflow_stages']}
+        assert stage_status['upload'] == 'completed'
+        assert stage_status['analysis'] == 'completed'
+        assert stage_status['stem_separation'] == 'completed'
+
+        # Raw audio + 4 stems = 5 stable, normalized artifact rows.
+        artifacts = db_store.list_artifacts(file_id, fresh_factory)
+        assert len(artifacts) == 5
+        assert {artifact['kind'] for artifact in artifacts} == {'raw_audio', 'stem'}
+        assert all(artifact['url'].startswith('/uploads/') for artifact in artifacts)
+    finally:
+        _restore_default_store()
+
+
+def test_session_restores_after_process_restart(tmp_path, monkeypatch):
+    """After a restart (fresh engine, no in-memory cache) the session resolves."""
+    _configure_persistent_store(tmp_path)
+    file_id = None
+    try:
+        file_id = _seed_analyzed_session(tmp_path, monkeypatch)
+        assert client.post('/api/separate', json={'file_id': file_id}).status_code == 200
+
+        # Simulate restart: drop the cached engine and the in-memory session.
+        main.SESSIONS.pop(file_id, None)
+        _restore_default_store()
+        _configure_persistent_store(tmp_path)  # re-open the same DB file
+
+        response = client.get(f'/api/session/{file_id}')
+        assert response.status_code == 200
+        body = response.json()
+        assert body['analysis']['status'] == 'completed'
+        assert body['stems']['status'] == 'completed'
+        assert body['artifact_url'].startswith('/uploads/')
+    finally:
+        if file_id:
+            main.SESSIONS.pop(file_id, None)
+        _restore_default_store()
+def test_persisted_state_is_idempotent_across_calls(tmp_path, monkeypatch):
+    """Repeated analyze/separate calls never duplicate or corrupt persisted state."""
+    from db import store as db_store
+
+    _configure_persistent_store(tmp_path)
+    try:
+        file_id = _seed_analyzed_session(tmp_path, monkeypatch)
+
+        second = client.post(
+            '/api/analyze',
+            json={'file_id': file_id, 'filename': 'analysis.wav', 'artifact_url': '/uploads/analysis.wav'},
+        )
+        assert second.status_code == 200
+
+        first_sep = client.post('/api/separate', json={'file_id': file_id})
+        second_sep = client.post('/api/separate', json={'file_id': file_id})
+        assert first_sep.status_code == 200
+        assert second_sep.status_code == 200
+
+        stored = db_store.get_session(file_id)
+        assert stored['analysis']['status'] == 'completed'
+        assert stored['stems']['status'] == 'completed'
+
+        artifacts = db_store.list_artifacts(file_id)
+        assert len(artifacts) == 5  # 1 raw + 4 stems, no duplicates
+        assert len([a for a in artifacts if a['kind'] == 'raw_audio']) == 1
+        assert len([a for a in artifacts if a['kind'] == 'stem']) == 4
+    finally:
+        _restore_default_store()
+
+
+def test_backend_is_local_and_flow_works_without_env(monkeypatch, tmp_path):
+    """With no R2/DB env, the app uses the local backend and the flow works."""
+    from services import storage as storage_module
+
+    for key in (
+        'DATABASE_URL',
+        'R2_ACCOUNT_ID',
+        'R2_ENDPOINT',
+        'R2_BUCKET',
+        'R2_ACCESS_KEY_ID',
+        'R2_SECRET_ACCESS_KEY',
+        'R2_PUBLIC_BASE_URL',
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    assert storage_module.active_backend() == 'local'
+    import db.engine as db_engine_module
+
+    assert db_engine_module.get_database_url() == 'sqlite:///:memory:'
+
+    file_id = _seed_analyzed_session(tmp_path, monkeypatch)
+    response = client.post('/api/separate', json={'file_id': file_id})
+    assert response.status_code == 200
+    assert response.json()['stems']['status'] == 'completed'
+    artifact_urls = [stem['url'] for stem in response.json()['stems']['stems']]
+    assert all(url.startswith('/uploads/stems/') for url in artifact_urls)
+
+
+def test_r2_mirror_returns_stable_url_when_configured(monkeypatch, tmp_path):
+    """When R2 is active, mirror_file returns a stable URL and marks the backend."""
+    from services import storage as storage_module
+
+    source = tmp_path / 'clip.wav'
+    source.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+
+    monkeypatch.setattr(storage_module, 'active_backend', lambda: 'r2')
+    monkeypatch.setattr(
+        storage_module,
+        '_upload_to_r2',
+        lambda settings, path, key, content_type: f'https://pub.example.com/{key}',
+    )
+
+    result = storage_module.mirror_file(
+        local_path=source,
+        object_key='stems/abc/vocals.wav',
+        content_type='audio/wav',
+        local_url='/uploads/stems/abc/vocals.wav',
+    )
+    assert result['storage_backend'] == 'r2'
+    assert result['url'] == 'https://pub.example.com/stems/abc/vocals.wav'
+    assert result['key'] == 'stems/abc/vocals.wav'
+
+
+def test_r2_mirror_degrades_to_local_on_failure(monkeypatch, tmp_path):
+    """An R2 upload failure falls back to local and is marked honestly."""
+    from services import storage as storage_module
+
+    source = tmp_path / 'clip.wav'
+    source.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+
+    monkeypatch.setattr(storage_module, 'active_backend', lambda: 'r2')
+    monkeypatch.setattr(
+        storage_module,
+        '_upload_to_r2',
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError('r2 down')),
+    )
+
+    result = storage_module.mirror_file(
+        local_path=source,
+        object_key='raw/abc/clip.wav',
+        content_type='audio/wav',
+        local_url='/uploads/clip-abc.wav',
+    )
+    assert result['storage_backend'] == 'local'
+    assert result['url'] == '/uploads/clip-abc.wav'
+    assert result['key'] is None
+
+
+def test_persistence_failure_degrades_gracefully(tmp_path, monkeypatch):
+    """A failing store never breaks the upload/analyze flow (local fallback)."""
+    import db.store as db_store_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError('database unavailable')
+
+    monkeypatch.setattr(db_store_module, 'save_session', _boom)
+    monkeypatch.setattr(db_store_module, 'save_artifact', _boom)
+    monkeypatch.setattr(db_store_module, 'get_session', _boom)
+
+    monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
+    file_path = tmp_path / 'degrade.wav'
+    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+
+    with file_path.open('rb') as file:
+        upload_response = client.post('/api/upload', files={'file': ('degrade.wav', file, 'audio/wav')})
+    assert upload_response.status_code == 200
+    file_id = upload_response.json()['file_id']
+
+    response = client.post(
+        '/api/analyze',
+        json={
+            'file_id': file_id,
+            'filename': upload_response.json()['filename'],
+            'artifact_url': upload_response.json()['artifact_url'],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()['analysis']['status'] == 'completed'

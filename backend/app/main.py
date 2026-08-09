@@ -31,6 +31,22 @@ from workers.tasks import (
     separate_stems_task,
 )
 
+# --- Story 2.3: durable persistence (AD-2) ----------------------------------
+# Optional integration: when SQLAlchemy/boto3 (or the db/services packages)
+# are not importable, the app boots and behaves exactly as before using the
+# in-memory SESSIONS dict + local uploads. Mirror of the Celery/Demucs pattern.
+try:
+    from db.engine import get_session_factory as _db_get_session_factory
+    from db import store as _db_store
+    from services import storage as _storage
+
+    STORE_AVAILABLE = True
+except Exception:  # pragma: no cover - optional-dependency degraded mode
+    _db_get_session_factory = None
+    _db_store = None
+    _storage = None
+    STORE_AVAILABLE = False
+
 app = FastAPI()
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / 'uploads'
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,6 +56,68 @@ STEM_DIR.mkdir(parents=True, exist_ok=True)
 app.mount('/uploads', StaticFiles(directory=UPLOAD_DIR), name='uploads')
 
 SESSIONS: dict[str, dict] = {}
+
+
+def _session_factory():
+    """Return the SQLAlchemy session factory when the store is available."""
+    if not STORE_AVAILABLE:
+        raise RuntimeError('Persistence store is not available.')
+    return _db_get_session_factory()
+
+
+def _store_session(session: dict) -> None:
+    """Best-effort durable persistence; never raise into request handlers."""
+    if STORE_AVAILABLE:
+        try:
+            _db_store.save_session(session, session_factory=_session_factory())
+        except Exception:
+            pass
+
+
+def _store_artifact(artifact: dict) -> None:
+    """Best-effort artifact registration; never raise into request handlers."""
+    if STORE_AVAILABLE:
+        try:
+            _db_store.save_artifact(artifact, session_factory=_session_factory())
+        except Exception:
+            pass
+
+
+def _resolve_session(file_id: str) -> dict | None:
+    """Resolve a session from the durable store first, then the in-memory dict.
+
+    Keeps ``SESSIONS`` populated as the read cache so every existing helper and
+    test that reads ``main.SESSIONS`` directly keeps working unchanged.
+    """
+    if STORE_AVAILABLE:
+        try:
+            stored = _db_store.get_session(file_id, session_factory=_session_factory())
+            if stored is not None:
+                SESSIONS[file_id] = stored
+                return stored
+        except Exception:
+            pass
+    return SESSIONS.get(file_id)
+
+
+def _mirror_file(
+    local_path: Path,
+    object_key: str,
+    content_type: str | None,
+    local_url: str,
+) -> dict:
+    """Mirror a local file into the active object-storage backend (best-effort)."""
+    if STORE_AVAILABLE and _storage is not None:
+        try:
+            return _storage.mirror_file(
+                local_path=local_path,
+                object_key=object_key,
+                content_type=content_type,
+                local_url=local_url,
+            )
+        except Exception:
+            pass
+    return {'url': local_url, 'storage_backend': 'local', 'key': None}
 
 ACCEPTED_TYPES = {'audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3'}
 ACCEPTED_EXTENSIONS = {'.wav', '.mp3'}
@@ -270,7 +348,14 @@ async def upload_audio(file: UploadFile = File(...)):
         while content := await file.read(1024 * 1024):
             buffer.write(content)
 
-    artifact_url = f"/uploads/{destination.name}"
+    local_artifact_url = f"/uploads/{destination.name}"
+    mirrored = _mirror_file(
+        local_path=destination,
+        object_key=f"raw/{file_id}/{destination.name}",
+        content_type=file.content_type,
+        local_url=local_artifact_url,
+    )
+    artifact_url = mirrored['url']
     SESSIONS[file_id] = {
         'file_id': file_id,
         'filename': destination.name,
@@ -292,6 +377,18 @@ async def upload_audio(file: UploadFile = File(...)):
         ],
         'created_at': datetime.now(timezone.utc).isoformat(),
     }
+    _store_artifact({
+        'file_id': file_id,
+        'name': destination.name,
+        'url': artifact_url,
+        'kind': 'raw_audio',
+        'storage_backend': mirrored['storage_backend'],
+        'key': mirrored['key'],
+        'size': destination.stat().st_size,
+        'format': extension.lstrip('.'),
+        'mime_type': file.content_type,
+    })
+    _store_session(SESSIONS[file_id])
     response = UploadResponse(
         file_id=file_id,
         filename=destination.name,
@@ -317,7 +414,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.get('/api/session/{file_id}')
 async def get_session(file_id: str):
-    session = SESSIONS.get(file_id)
+    session = _resolve_session(file_id)
     if not session:
         return JSONResponse(status_code=404, content={'message': 'Session not found.'})
     return JSONResponse(session)
@@ -325,7 +422,7 @@ async def get_session(file_id: str):
 
 @app.post('/api/analyze', response_model=AnalyzeResponse)
 async def analyze_audio(payload: AnalyzeRequest):
-    session = SESSIONS.get(payload.file_id)
+    session = _resolve_session(payload.file_id)
     if not session:
         return JSONResponse(
             status_code=404,
@@ -382,6 +479,7 @@ async def analyze_audio(payload: AnalyzeRequest):
                 'next_action': failed_analysis.next_action,
             },
         ]
+        _store_session(session)
         return JSONResponse(
             status_code=422,
             content=AnalyzeErrorResponse(
@@ -413,6 +511,7 @@ async def analyze_audio(payload: AnalyzeRequest):
                 'next_action': failed_analysis.next_action,
             },
         ]
+        _store_session(session)
         return JSONResponse(
             status_code=500,
             content=AnalyzeErrorResponse(
@@ -441,12 +540,13 @@ async def analyze_audio(payload: AnalyzeRequest):
         {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
         {'stage': 'analysis', 'status': 'completed', 'message': 'Analysis completed successfully.'},
     ]
+    _store_session(session)
 
     return JSONResponse(build_analyze_response(payload.file_id, completed_analysis))
 
 @app.post('/api/separate', response_model=SeparateResponse)
 async def separate_audio(payload: SeparateRequest):
-    session = SESSIONS.get(payload.file_id)
+    session = _resolve_session(payload.file_id)
     if not session:
         stages = build_stage_dicts(
             'pending',
@@ -552,16 +652,35 @@ async def separate_audio(payload: SeparateRequest):
             ).model_dump(),
         )
 
-    stem_artifacts = [
-        StemArtifact(
-            name=stem['name'],
-            url=f"/uploads/stems/{session['file_id']}/{stem['filename']}",
-            size=stem.get('size'),
-            format=stem.get('format'),
-            mime_type=mime_for_extension(stem.get('format')),
+    stem_artifacts = []
+    for stem in worker_result['stems']:
+        stem_local_url = f"/uploads/stems/{session['file_id']}/{stem['filename']}"
+        mirrored = _mirror_file(
+            local_path=stems_dir / stem['filename'],
+            object_key=f"stems/{session['file_id']}/{stem['filename']}",
+            content_type=mime_for_extension(stem.get('format')),
+            local_url=stem_local_url,
         )
-        for stem in worker_result['stems']
-    ]
+        _store_artifact({
+            'file_id': session['file_id'],
+            'name': stem['filename'],
+            'url': mirrored['url'],
+            'kind': 'stem',
+            'storage_backend': mirrored['storage_backend'],
+            'key': mirrored['key'],
+            'size': stem.get('size'),
+            'format': stem.get('format'),
+            'mime_type': mime_for_extension(stem.get('format')),
+        })
+        stem_artifacts.append(
+            StemArtifact(
+                name=stem['name'],
+                url=mirrored['url'],
+                size=stem.get('size'),
+                format=stem.get('format'),
+                mime_type=mime_for_extension(stem.get('format')),
+            )
+        )
     completed_stems = StemsMetadata(
         status='completed',
         stems=stem_artifacts,
@@ -573,5 +692,6 @@ async def separate_audio(payload: SeparateRequest):
     session['stems'] = completed_stems.model_dump()
     stages = build_stage_dicts(analysis_status, analysis_message, 'completed', 'Stem separation completed successfully.')
     session['workflow_stages'] = stages
+    _store_session(session)
 
     return JSONResponse(build_separation_response(session['file_id'], completed_stems))
