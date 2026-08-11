@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useCallback, useMemo, useState } from 'react';
+import StemTimeline from './StemTimeline';
 
 const acceptedTypes = ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3'];
 const acceptedExtensions = ['.wav', '.mp3'];
@@ -573,23 +574,7 @@ export default function UploadPanel() {
                 <p aria-label="Stems ready for review" style={{ margin: 0, color: '#a7f3d0', fontWeight: 600 }}>
                   Stems are ready for review.
                 </p>
-                <ul
-                  aria-label="Stem list"
-                  style={{
-                    margin: 0,
-                    paddingLeft: '1rem',
-                    display: 'grid',
-                    gap: '0.3rem',
-                    listStyle: 'disc',
-                  }}
-                >
-                  {(stemSeparation.stems ?? []).map((stem) => (
-                    <li key={stem.name} style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', fontSize: '0.9rem' }}>
-                      <span>{stem.name}</span>
-                      <span style={{ color: '#94a3b8' }}>{stem.format ? stem.format.toUpperCase() : 'WAV'}</span>
-                    </li>
-                  ))}
-                </ul>
+                <StemTimeline stems={stemSeparation.stems ?? []} />
               </>
             )}
             {stemSeparation.next_action && (
