@@ -38,6 +38,7 @@ class SessionRecord(Base):
     analysis: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     stems: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     workflow_stages: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[str] = mapped_column(String(64), default=utc_now_iso)
     updated_at: Mapped[str] = mapped_column(String(64), default=utc_now_iso)
 
 

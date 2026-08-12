@@ -8,3 +8,4 @@ SQLAlchemy>=2.0.51,<2.1
 psycopg[binary]>=3.3.4
 alembic>=1.19.1
 boto3>=1.43.67
+python-dotenv>=1.0.1

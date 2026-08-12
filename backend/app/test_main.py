@@ -2,8 +2,29 @@ import io
 from pathlib import Path
 import main
 from fastapi.testclient import TestClient
+import pytest
 
 client = TestClient(main.app)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_backend_env(monkeypatch):
+    """Force local/degraded backends for every test so the suite never depends on
+    (or writes to) real R2/Neon regardless of the ambient environment, and the
+    pre-existing Story 1.1-2.2 expectations (e.g. /uploads/ artifact URLs) hold."""
+    for key in (
+        'DATABASE_URL',
+        'R2_ACCOUNT_ID',
+        'R2_ENDPOINT',
+        'R2_BUCKET',
+        'R2_ACCESS_KEY_ID',
+        'R2_SECRET_ACCESS_KEY',
+        'R2_PUBLIC_BASE_URL',
+    ):
+        monkeypatch.delenv(key, raising=False)
+    import db.engine as db_engine_module
+
+    db_engine_module.reset_engine()
 
 def test_upload_audio_success(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
@@ -512,3 +533,132 @@ def test_persistence_failure_degrades_gracefully(tmp_path, monkeypatch):
     )
     assert response.status_code == 200
     assert response.json()['analysis']['status'] == 'completed'
+
+
+# --- Regression tests for 2026-08-12 review fixes ---------------------------
+# These lock in the patches applied in the code review that followed the
+# "No module named 'psycopg2'" / "Unable to load ... audio" reports.
+
+
+def test_normalize_database_url_rewrites_to_psycopg3():
+    """A bare postgres URL is rewritten to the installed psycopg (v3) driver so
+    neither the app engine nor the alembic migration path hits missing psycopg2."""
+    from db.engine import normalize_database_url
+
+    assert (
+        normalize_database_url('postgresql://u:p@host/db?sslmode=require')
+        == 'postgresql+psycopg://u:p@host/db?sslmode=require'
+    )
+    assert normalize_database_url('postgres://u:p@host/db') == 'postgresql+psycopg://u:p@host/db'
+    # Already-on-psycopg3 URLs and sqlite are left untouched (idempotent).
+    assert normalize_database_url('postgresql+psycopg://u:p@host/db') == 'postgresql+psycopg://u:p@host/db'
+    assert normalize_database_url('sqlite:///x.db') == 'sqlite:///x.db'
+    assert normalize_database_url('') == ''
+
+
+def test_save_artifact_upsert_is_idempotent(tmp_path, monkeypatch):
+    """Re-registering the same artifact (file_id, name, kind) updates rather than
+    duplicates, so a retried separation never inflates the artifact count."""
+    import db.engine as db_engine_module
+
+    db_url = _configure_persistent_store(tmp_path)
+    try:
+        from db import store as db_store
+
+        artifact = {
+            'file_id': 'art-upsert-session',
+            'name': 'vocals.wav',
+            'kind': 'stem',
+            'url': '/uploads/stems/art-upsert-session/vocals.wav',
+            'storage_backend': 'local',
+            'key': None,
+            'size': 1024,
+            'format': 'wav',
+            'mime_type': 'audio/wav',
+        }
+        db_store.save_artifact(artifact)
+        db_store.save_artifact({**artifact, 'size': 2048, 'url': '/uploads/stems/art-upsert-session/vocals-2.wav'})
+
+        rows = db_store.list_artifacts('art-upsert-session')
+        assert len(rows) == 1
+        assert rows[0]['size'] == 2048
+        assert rows[0]['url'].endswith('vocals-2.wav')
+    finally:
+        _restore_default_store()
+
+
+def test_resolve_session_prefers_fresh_in_memory_over_stale_store(tmp_path, monkeypatch):
+    """A session present in the in-memory SESSIONS dict (the authoritative within
+    a process) wins over an older store row, so a silently-failed store write can
+    never resurrect stale state on a later read."""
+    import db.engine as db_engine_module
+
+    db_url = _configure_persistent_store(tmp_path)
+    file_id = 'resolve-prefers-fresh'
+    try:
+        from db import store as db_store
+
+        # Store holds an OLDER/empty row (as if a write landed before analysis).
+        db_store.save_session({'file_id': file_id, 'analysis': None, 'workflow_stages': []})
+
+        # In-memory holds the NEWER state.
+        main.SESSIONS[file_id] = {
+            'file_id': file_id,
+            'analysis': {'status': 'completed', 'bpm': 120.0, 'key': 'A minor'},
+            'workflow_stages': [{'stage': 'analysis', 'status': 'completed', 'message': 'done'}],
+        }
+
+        resolved = main._resolve_session(file_id)
+        assert resolved['analysis']['status'] == 'completed'
+        assert resolved['analysis']['bpm'] == 120.0
+    finally:
+        main.SESSIONS.pop(file_id, None)
+        _restore_default_store()
+
+
+def test_engine_degrades_to_sqlite_when_postgres_schema_missing(monkeypatch):
+    """A reachable-but-unmigrated Postgres (missing sessions/artifacts tables) is
+    detected at engine build and degrades to the local SQLite fallback with an
+    actionable warning, instead of silently running a non-durable store and
+    spamming per-request UndefinedTable errors."""
+    import db.engine as db_engine_module
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _FakeInspector:
+        def has_table(self, name):  # noqa: ARG002 - schema intentionally missing
+            return False
+
+    class _FakeEngine:
+        def connect(self):
+            return _FakeConn()
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setenv('DATABASE_URL', 'postgresql://u:p@host/db')
+    calls: list[str] = []
+
+    def fake_create_engine(url, *args, **kwargs):
+        calls.append(url)
+        return _FakeEngine()
+
+    monkeypatch.setattr(db_engine_module, 'create_engine_for_url', fake_create_engine)
+    monkeypatch.setattr(db_engine_module, 'inspect', lambda engine: _FakeInspector())
+    monkeypatch.setattr(db_engine_module.Base.metadata, 'create_all', lambda engine: None)
+    db_engine_module.reset_engine()
+    try:
+        db_engine_module.get_engine()
+        assert calls == [
+            'postgresql+psycopg://u:p@host/db',  # candidate engine
+            'sqlite:///:memory:',  # honest degraded fallback
+        ]
+    finally:
+        db_engine_module.reset_engine()
+
+

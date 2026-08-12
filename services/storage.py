@@ -17,6 +17,12 @@ from pathlib import Path
 from typing import Optional
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / '.env')
+except Exception:  # pragma: no cover - dotenv is an optional convenience loader
+    pass
+
+try:
     import boto3
     from botocore.config import Config
 
@@ -49,10 +55,39 @@ def get_r2_settings() -> Optional[dict]:
     }
 
 
+def public_read_base(settings: dict) -> Optional[str]:
+    """Return the base URL a browser can actually fetch, or None.
+
+    R2 writes always go to the private S3 API endpoint
+    (``https://<ACCOUNT_ID>.r2.cloudflarestorage.com``), which requires signed
+    requests and returns 403/400 to an unsigned browser. That endpoint must NOT
+    be used as the public read base. A usable read base is a public r2.dev
+    subdomain or a custom public domain attached to the bucket (see .env.example).
+    """
+    from urllib.parse import urlparse
+
+    base = (settings.get('public_base_url') or '').strip().rstrip('/')
+    if not base:
+        return None
+    host = (urlparse(base).hostname or '').lower()
+    if host.endswith(_R2_ENDPOINT_SUFFIX):
+        return None
+    return base
+
+
 def active_backend() -> str:
-    """Return the object-storage backend currently in effect: 'r2' or 'local'."""
-    if BOTO3_AVAILABLE and get_r2_settings() is not None:
-        return 'r2'
+    """Return the object-storage backend that can SERVE URLs: 'r2' or 'local'.
+
+    Merely having a bucket + credentials is not enough: when the only configured
+    public base is the private S3 endpoint, the generated URLs cannot be fetched
+    by the browser (the stem player would fail). We therefore only claim the r2
+    backend when a genuine public-read base URL is configured and otherwise
+    degrade to ``local``, which the ``/uploads`` mount + frontend proxy serve.
+    """
+    settings = get_r2_settings()
+    if BOTO3_AVAILABLE and settings is not None:
+        if public_read_base(settings) is not None:
+            return 'r2'
     return 'local'
 
 

@@ -16,6 +16,11 @@ env/
 venv/
 .env
 
+# Databases (local SQLite fallbacks)
+*.db
+*.sqlite
+*.sqlite3
+
 # Build outputs
 dist/
 build/
@@ -40,6 +45,7 @@ yarn-error.log*
 # BMad / Agent related
 .scratch/
 _bmad-output/
+
 *.tmp
 
 # Others | Folders

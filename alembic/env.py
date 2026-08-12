@@ -17,6 +17,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT_DIR / '.env')
+except Exception:  # pragma: no cover - optional convenience loader
+    pass
+
+from db.engine import normalize_database_url  # noqa: E402
 from db.models import Base  # noqa: E402
 
 config = context.config
@@ -24,7 +31,14 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = os.environ.get('DATABASE_URL', '').strip() or config.get_main_option('sqlalchemy.url')
+database_url = (
+    os.environ.get('DATABASE_URL', '').strip()
+    or config.get_main_option('sqlalchemy.url')
+)
+# Apply the same psycopg (v3) driver rewrite the app engine uses so a bare
+# 'postgresql://...' DATABASE_URL (as documented in .env.example) resolves to
+# the installed driver instead of the missing psycopg2.
+database_url = normalize_database_url(database_url)
 config.set_main_option('sqlalchemy.url', database_url)
 
 target_metadata = Base.metadata

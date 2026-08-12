@@ -23,6 +23,7 @@ _SESSION_COLUMNS = (
     'analysis',
     'stems',
     'workflow_stages',
+    'created_at',
 )
 
 
@@ -56,12 +57,32 @@ def get_session(file_id: str, session_factory: Optional[sessionmaker] = None) ->
 
 
 def save_artifact(artifact: dict, session_factory: Optional[sessionmaker] = None) -> None:
-    """Insert an artifact row (raw audio, stem file, or other asset)."""
+    """Upsert an artifact row keyed by ``(file_id, name, kind)``.
+
+    Idempotent: re-registering the same artifact (e.g. a retried separation that
+    previously left a ``failed``/``active`` stems state) updates the existing row
+    instead of inserting a duplicate, so the store never lies about how many
+    artifacts a session produced.
+    """
     factory = session_factory or get_session_factory()
     allowed = {column.name for column in ArtifactRecord.__table__.columns}
     values = {k: v for k, v in artifact.items() if k in allowed and k != 'id'}
     with factory() as db:
-        db.add(ArtifactRecord(**values))
+        row = (
+            db.query(ArtifactRecord)
+            .filter_by(
+                file_id=values.get('file_id'),
+                name=values.get('name'),
+                kind=values.get('kind', 'asset'),
+            )
+            .first()
+        )
+        if row is None:
+            db.add(ArtifactRecord(**values))
+        else:
+            for column, value in values.items():
+                if column != 'file_id':
+                    setattr(row, column, value)
         db.commit()
 
 

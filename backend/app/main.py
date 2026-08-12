@@ -5,10 +5,13 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import sys
 import uuid
+import logging
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+logger = logging.getLogger(__name__)
 
 from shared.schemas import (
     AnalyzeErrorResponse,
@@ -70,8 +73,8 @@ def _store_session(session: dict) -> None:
     if STORE_AVAILABLE:
         try:
             _db_store.save_session(session, session_factory=_session_factory())
-        except Exception:
-            pass
+        except Exception as exc:  # pragma: no cover - best-effort durability
+            logger.warning('Failed to persist session %s: %s', session.get('file_id'), exc)
 
 
 def _store_artifact(artifact: dict) -> None:
@@ -79,24 +82,32 @@ def _store_artifact(artifact: dict) -> None:
     if STORE_AVAILABLE:
         try:
             _db_store.save_artifact(artifact, session_factory=_session_factory())
-        except Exception:
-            pass
+        except Exception as exc:  # pragma: no cover - best-effort durability
+            logger.warning('Failed to persist artifact %s: %s', artifact.get('name'), exc)
 
 
 def _resolve_session(file_id: str) -> dict | None:
-    """Resolve a session from the durable store first, then the in-memory dict.
+    """Resolve a session from the in-memory dict first, then the durable store.
 
-    Keeps ``SESSIONS`` populated as the read cache so every existing helper and
-    test that reads ``main.SESSIONS`` directly keeps working unchanged.
+    ``SESSIONS`` is the authoritative cache within a process: every mutation
+    writes to it directly, so an entry present here is at least as fresh as the
+    store (a store write may have failed and been logged as a WARNING). The store
+    is consulted only on a cache miss — exactly the process-restart path, where
+    the store is the only surviving source of truth — and the result is seeded
+    back into ``SESSIONS`` so every existing helper and test that reads
+    ``main.SESSIONS`` directly keeps working unchanged.
     """
+    cached = SESSIONS.get(file_id)
+    if cached is not None:
+        return cached
     if STORE_AVAILABLE:
         try:
             stored = _db_store.get_session(file_id, session_factory=_session_factory())
             if stored is not None:
                 SESSIONS[file_id] = stored
                 return stored
-        except Exception:
-            pass
+        except Exception as exc:  # pragma: no cover - store availability guard
+            logger.warning('Failed to resolve session %s from store: %s', file_id, exc)
     return SESSIONS.get(file_id)
 
 
@@ -115,8 +126,8 @@ def _mirror_file(
                 content_type=content_type,
                 local_url=local_url,
             )
-        except Exception:
-            pass
+        except Exception as exc:  # pragma: no cover - storage availability guard
+            logger.warning('Object-storage mirror failed for %s, falling back to local: %s', object_key, exc)
     return {'url': local_url, 'storage_backend': 'local', 'key': None}
 
 ACCEPTED_TYPES = {'audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3'}
