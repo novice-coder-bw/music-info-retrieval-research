@@ -1,15 +1,47 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
+import socket
+from urllib.parse import urlparse
 
 try:
     from celery import Celery
 
     app = Celery('workers', broker='redis://localhost:6379/0', backend='redis://localhost:6379/0')
+    # Fail fast when the Redis broker is unreachable instead of blocking in
+    # kombu's connection-retry loop (default max_retries=100 with backoff can
+    # hang for minutes). This lets the app's in-process fallback
+    # (run_analysis_task / run_separation_task) take over immediately when a
+    # broker/worker is not running, while preserving normal async dispatch
+    # whenever Redis + the worker ARE running.
+    app.conf.broker_connection_retry_on_startup = False
+    app.conf.broker_connection_max_retries = 0
     CELERY_AVAILABLE = True
 except ImportError:
     app = None
     CELERY_AVAILABLE = False
+
+
+def broker_reachable(timeout: float = 1.0) -> bool:
+    """Return True quickly if the Redis broker accepts TCP connections.
+
+    Used to gate Celery dispatch so the app falls back to in-process execution
+    fast (instead of blocking in kombu's result-backend reconnect loop) when no
+    broker is running. When Celery is absent, there is nothing to reach.
+    """
+    if app is None:
+        return False
+    url = app.conf.broker_url
+    if url is None:
+        return False
+    parsed = urlparse(url)
+    host = parsed.hostname or '127.0.0.1'
+    port = parsed.port or 6379
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 STEM_NAMES = ['drums', 'bass', 'other', 'vocals']
 

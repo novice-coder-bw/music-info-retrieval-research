@@ -22,6 +22,11 @@ def _hermetic_backend_env(monkeypatch):
         'R2_PUBLIC_BASE_URL',
     ):
         monkeypatch.delenv(key, raising=False)
+    # Never dispatch to a real Celery worker during tests: force the app's
+    # in-process fallback regardless of whether a Redis broker happens to be
+    # running (a broker without a worker would make analyze/separate block on
+    # their 30s result timeout).
+    monkeypatch.setattr(main, 'broker_reachable', lambda timeout=1.0: False)
     import db.engine as db_engine_module
 
     db_engine_module.reset_engine()

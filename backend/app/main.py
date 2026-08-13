@@ -30,6 +30,7 @@ from shared.schemas import (
 from workers.tasks import (
     analyze_audio as run_worker_analysis,
     analyze_audio_task,
+    broker_reachable,
     separate_stems as run_worker_separation,
     separate_stems_task,
 )
@@ -212,8 +213,13 @@ def build_analyze_response(file_id: str, analysis: AnalysisMetadata) -> dict:
 
 
 def run_analysis_task(file_id: str, file_path: str) -> dict:
-    """Execute analysis via Celery when available, otherwise run in-process."""
-    if analyze_audio_task is not None:
+    """Execute analysis via Celery when available, otherwise run in-process.
+
+    Celery dispatch is gated on the broker being reachable so a downed/absent
+    Redis falls back to in-process execution immediately rather than blocking
+    in kombu's reconnect loop.
+    """
+    if analyze_audio_task is not None and broker_reachable():
         try:
             async_result = analyze_audio_task.delay(file_id, file_path)
             return async_result.get(timeout=30)
@@ -285,8 +291,12 @@ def build_separation_response(file_id: str, stems: StemsMetadata) -> dict:
 
 
 def run_separation_task(file_id: str, file_path: str, stems_dir) -> dict:
-    """Execute separation via Celery when available, otherwise run in-process."""
-    if separate_stems_task is not None:
+    """Execute separation via Celery when available, otherwise run in-process.
+
+    Gated on the broker being reachable for the same reason as
+    ``run_analysis_task`` (fast in-process fallback when Redis is down).
+    """
+    if separate_stems_task is not None and broker_reachable():
         try:
             async_result = separate_stems_task.delay(file_id, file_path, str(stems_dir))
             return async_result.get(timeout=30)
