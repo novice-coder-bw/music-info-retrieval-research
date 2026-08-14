@@ -52,7 +52,7 @@ Build a minimal web platform that allows a user to upload a song, analyze it for
 
 > * **Stem Separation:** Demucs (HTDemucs v4)  
 > * **MIDI Transcription:** Basic-Pitch  
-> * **Audio Analysis:** madmom (BPM/Beat Tracking), essentia (Key/Structure)
+> * **Audio Analysis:** essentia (BPM/Beat Tracking, Key/Structure)
 
 ### **Data & Infrastructure**
 

@@ -1,8 +1,17 @@
+import hashlib
 import io
+from datetime import datetime, timezone
 from pathlib import Path
 import main
 from fastapi.testclient import TestClient
 import pytest
+from workers import tasks as tasks_module
+
+# Retain the real Demucs separation backend. The hermetic flow tests patch
+# tasks_module._separate_with_demucs to a fast test double so they don't run the
+# full HTDemucs model on CPU; this retained reference is used by the one dedicated
+# real-separation test and the real-path honest-failure unit test.
+_REAL_SEPARATE_WITH_DEMUCS = tasks_module._separate_with_demucs
 
 client = TestClient(main.app)
 
@@ -30,6 +39,66 @@ def _hermetic_backend_env(monkeypatch):
     import db.engine as db_engine_module
 
     db_engine_module.reset_engine()
+
+
+def _make_wav(path, bpm=120.0, sr=44100, dur=4.0) -> None:
+    """Write a valid mono WAV (tonal bed + a percussive click at ``bpm``).
+
+    Starter 2.4 uses this real audio for analysis/separation so the results are
+    computed from actual audio instead of a dummy 12-byte header.
+    """
+    import numpy as np
+    import wave
+
+    n = int(sr * dur)
+    t = np.arange(n) / sr
+    x = 0.35 * np.sin(2 * np.pi * 220.0 * t) + 0.18 * np.sin(2 * np.pi * 330.0 * t)
+    beat = int(60.0 / bpm * sr)
+    clicks = np.zeros(n)
+    for start in range(0, n, beat):
+        clicks[start : start + int(0.01 * sr)] = 0.9
+    x = np.clip(x + clicks, -1.0, 1.0).astype('float32')
+    with wave.open(str(path), 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes((x * 32767).astype('int16').tobytes())
+
+
+def _fake_real_stems(file_id, file_path, stems_dir):
+    """Fast, hermetic test double for the real Demucs separation backend.
+
+    Writes four byte-distinct 32-bit float WAV stems (drums, bass, other,
+    vocals) so the route/persistence flow tests stay fast without running
+    HTDemucs on CPU, and proves the stems are never byte-identical copies of the
+    mix (real distinctness of the actual model is covered by the dedicated
+    ``test_separate_writes_four_distinct_real_stems`` test).
+    """
+    import struct
+
+    source_bytes = Path(file_path).read_bytes() if Path(file_path).exists() else b'RIFF....WAVE'
+    stems_dir = Path(stems_dir)
+    stems_dir.mkdir(parents=True, exist_ok=True)
+    out = []
+    for i, name in enumerate(['drums', 'bass', 'other', 'vocals']):
+        payload = b'RIFF\x00\x00\x00\x00WAVE' + b'fmt ' + struct.pack('<I', 16) + struct.pack(
+            '<HHIIHH', 3, 1, 8000, 8000 * 4, 4, 32
+        ) + b'data' + struct.pack('<I', 4) + bytes([(len(source_bytes) + i) % 251] * 18)
+        stem_path = stems_dir / f'{name}.wav'
+        stem_path.write_bytes(payload)
+        out.append({'name': name, 'filename': stem_path.name, 'size': stem_path.stat().st_size, 'format': 'wav'})
+    return {
+        'file_id': file_id,
+        'status': 'completed',
+        'stems': out,
+        'separated_at': datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@pytest.fixture(autouse=True)
+def _fake_separation_backend(monkeypatch):
+    """Use the fast, hermetic separation double for every flow/persistence test."""
+    monkeypatch.setattr(tasks_module, '_separate_with_demucs', _fake_real_stems)
 
 def test_upload_audio_success(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
@@ -97,7 +166,7 @@ def test_upload_audio_corrupt_mp3():
 def test_analyze_audio_success(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
     file_path = tmp_path / 'analysis.wav'
-    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+    _make_wav(file_path)
 
     with file_path.open('rb') as file:
         upload_response = client.post('/api/upload', files={'file': ('analysis.wav', file, 'audio/wav')})
@@ -117,7 +186,9 @@ def test_analyze_audio_success(tmp_path, monkeypatch):
     assert analysis_response.status_code == 200
     data = analysis_response.json()
     assert data['analysis']['status'] == 'completed'
-    assert data['analysis']['bpm'] > 0
+    # Real (non-hardcoded) BPM: an ~120 BPM fixture yields 90-150 BPM, not the
+    # old placeholder 118.0 hardcode.
+    assert 90 <= data['analysis']['bpm'] <= 150
     assert data['analysis']['key']
     assert data['analysis']['structure']
     assert data['analysis']['task_id']
@@ -143,7 +214,7 @@ def test_analyze_audio_missing_file_id():
 def test_analyze_audio_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
     file_path = tmp_path / 'analysis.wav'
-    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+    _make_wav(file_path)
 
     with file_path.open('rb') as file:
         upload_response = client.post('/api/upload', files={'file': ('analysis.wav', file, 'audio/wav')})
@@ -185,7 +256,7 @@ def _seed_analyzed_session(tmp_path, monkeypatch, filename='analysis.wav'):
     monkeypatch.setattr(main, 'STEM_DIR', tmp_path / 'stems')
     main.STEM_DIR.mkdir(parents=True, exist_ok=True)
     file_path = tmp_path / filename
-    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+    _make_wav(file_path)
     with file_path.open('rb') as file:
         upload_response = client.post('/api/upload', files={'file': (filename, file, 'audio/wav')})
     file_id = upload_response.json()['file_id']
@@ -208,6 +279,7 @@ def test_separate_audio_success(tmp_path, monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data['stems']['status'] == 'completed'
+    assert data['stems']['method'] == 'demucs'
     stem_names = [stem['name'] for stem in data['stems']['stems']]
     assert stem_names == ['drums', 'bass', 'other', 'vocals']
     for stem in data['stems']['stems']:
@@ -521,7 +593,7 @@ def test_persistence_failure_degrades_gracefully(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
     file_path = tmp_path / 'degrade.wav'
-    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+    _make_wav(file_path)
 
     with file_path.open('rb') as file:
         upload_response = client.post('/api/upload', files={'file': ('degrade.wav', file, 'audio/wav')})
@@ -667,3 +739,115 @@ def test_engine_degrades_to_sqlite_when_postgres_schema_missing(monkeypatch):
         db_engine_module.reset_engine()
 
 
+# --- Story 2.4: real essentia analysis + real Demucs stems -------------------
+
+
+def test_analysis_is_data_driven_not_hardcoded(tmp_path):
+    """Two fixtures at different tempos yield different real BPM/metadata."""
+
+    slow = tmp_path / 'slow.wav'
+    fast = tmp_path / 'fast.wav'
+    _make_wav(slow, bpm=120)
+    _make_wav(fast, bpm=172)
+
+    slow_result = tasks_module.build_analysis_result('slow-id', str(slow))
+    fast_result = tasks_module.build_analysis_result('fast-id', str(fast))
+
+    assert slow_result['status'] == 'completed'
+    assert fast_result['status'] == 'completed'
+    assert slow_result['bpm'] not in (None, 118.0)  # not the old hardcode
+    assert slow_result['key']
+    assert slow_result['structure']
+    # Data-driven, not hardcoded: different tempos produce different BPM.
+    assert slow_result['bpm'] != fast_result['bpm']
+    assert fast_result['bpm'] > slow_result['bpm']
+
+
+def test_separate_writes_four_distinct_real_stems(tmp_path):
+    """The REAL HTDemucs path writes four byte-distinct stems, distinct from source."""
+    src = tmp_path / 'real.wav'
+    _make_wav(src, bpm=120, dur=1.5)  # short clip to keep CPU time bounded
+    stems_dir = tmp_path / 'stems'
+
+    result = _REAL_SEPARATE_WITH_DEMUCS('real-id', str(src), stems_dir)
+
+    assert result['status'] == 'completed'
+    names = [stem['name'] for stem in result['stems']]
+    assert names == ['drums', 'bass', 'other', 'vocals']
+    hashes = {}
+    for stem in result['stems']:
+        p = stems_dir / stem['filename']
+        assert p.exists() and p.stat().st_size > 0
+        hashes[stem['name']] = hashlib.md5(p.read_bytes()).hexdigest()
+    # Four distinct stems: byte-different from each other...
+    assert len(set(hashes.values())) == 4
+    # ...and byte-different from the source mix (never shutil.copyfile copies).
+    src_hash = hashlib.md5(src.read_bytes()).hexdigest()
+    assert all(h != src_hash for h in hashes.values())
+
+
+def test_separate_writes_four_distinct_real_stems_long_track(tmp_path):
+    """Regression: a track LONGER than SPLIT_SEGMENT_SECONDS (which forces the
+    chunked apply path) must NOT raise the old
+    "shape '[1, 4, -1, N]' is invalid for input of size M" /
+    "'>' not supported between instances of 'tuple' and 'float'" errors.
+    It must produce four byte-distinct stems."""
+        # 25s of audio, just above the 20s chunking threshold, to force the
+    # chunked apply path without making the test prohibitively slow on CPU.
+    src = tmp_path / 'long.wav'
+    _make_wav(src, bpm=120, dur=25.0)
+    stems_dir = tmp_path / 'stems'
+
+    result = _REAL_SEPARATE_WITH_DEMUCS('long-id', str(src), stems_dir)
+
+    assert result['status'] == 'completed'
+    names = [stem['name'] for stem in result['stems']]
+    assert names == ['drums', 'bass', 'other', 'vocals']
+    hashes = {}
+    for stem in result['stems']:
+        p = stems_dir / stem['filename']
+        assert p.exists() and p.stat().st_size > 0
+        hashes[stem['name']] = hashlib.md5(p.read_bytes()).hexdigest()
+    # Four distinct stems, and all distinct from the source mix.
+    assert len(set(hashes.values())) == 4
+    src_hash = hashlib.md5(src.read_bytes()).hexdigest()
+    assert all(h != src_hash for h in hashes.values())
+
+
+def test_real_separation_returns_honest_failure_when_model_unavailable(tmp_path, monkeypatch):
+    """With no model, the real separation path reports an honest failed status."""
+    monkeypatch.setattr(tasks_module, '_available_demucs_model', lambda: None)
+    src = tmp_path / 'm.wav'
+    _make_wav(src)
+    result = _REAL_SEPARATE_WITH_DEMUCS('id', str(src), tmp_path / 'stems')
+    assert result['status'] == 'failed'
+    assert result['stems'] == []
+    assert result['message']
+    assert result['next_action']
+    assert 'completed' != result['status']
+
+
+def test_separate_reports_honest_failure_via_api(tmp_path, monkeypatch):
+    """The API surfaces an honest separation failure instead of fake completed stems."""
+    file_id = _seed_analyzed_session(tmp_path, monkeypatch)
+
+    def _unavailable(file_id, file_path, stems_dir):
+        return {
+            'file_id': file_id,
+            'status': 'failed',
+            'stems': [],
+            'message': 'Real stem separation is unavailable because the Demucs model could not be loaded.',
+            'next_action': 'Install demucs>=4.0.0 and torch>=2.0.0 in the runtime and retry stem separation.',
+            'separated_at': datetime.now(timezone.utc).isoformat(),
+        }
+
+    monkeypatch.setattr(tasks_module, '_separate_with_demucs', _unavailable)
+
+    response = client.post('/api/separate', json={'file_id': file_id})
+
+    assert response.status_code == 422
+    data = response.json()
+    assert data['error_code'] == 'separation_processing_failed'
+    assert data['stage'] == 'stem_separation'
+    assert 'Demucs model could not be loaded' in data['message']
+    assert main.SESSIONS[file_id]['stems']['status'] == 'failed'

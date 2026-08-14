@@ -21,19 +21,19 @@ This document outlines the core technology stack used in the Music Analysis Plat
 | :--- | :--- |
 | **Framework** | Next.js (2026 stable) |
 | **Library** | React (2026 stable) |
-| **UI Components** | shadcn/ui |
-| **Styling** | Tailwind CSS |
+| **UI Components** | Custom React components (inline styles); shadcn/ui is planned but not yet adopted |
+| **Styling** | CSS (inline styles via React `style`, `globals.css`) — Tailwind CSS not yet adopted |
 | **Audio Visualization** | WaveSurfer.js (2026 stable) |
+| **Icons** | lucide-react |
 
 ## Audio Processing & Music Information Retrieval (MIR)
 
 | Library | Purpose |
 | :--- | :--- |
 | **Demucs** | HTDemucs v4 (Source separation) |
-| **Basic-Pitch** | Note detection / Audio-to-MIDI |
-| **madmom** | Audio signal processing / Beat tracking |
-| **essentia** | Music analysis / Feature extraction |
-| **pyableton** | Ableton Live integration |
+| **Basic-Pitch** | Note detection / Audio-to-MIDI (planned) |
+| **essentia** | Music analysis / Feature extraction (BPM, key, structure) |
+| **pyableton** | Ableton Live integration (planned) |
 
 ## Infrastructure & Environment
 

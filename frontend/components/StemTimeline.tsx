@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import WavesurferPlayer from '@wavesurfer/react';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions';
+import { Pause, Play } from 'lucide-react';
 
 type StemArtifact = {
   name: string;
@@ -145,7 +146,7 @@ function StemRow({ stem, plugins, callbacks, isActive, hasError }: StemRowProps)
               fontSize: '0.85rem',
             }}
           >
-            {isActive ? 'Pause' : 'Play'}
+            {isActive ? <Pause size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
           </button>
         </div>
       </div>

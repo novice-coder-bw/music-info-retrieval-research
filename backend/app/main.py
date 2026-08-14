@@ -545,6 +545,35 @@ async def analyze_audio(payload: AnalyzeRequest):
             ).model_dump(),
         )
 
+    # Real analysis (Story 2.4) reports an honest failure through the worker
+    # result instead of fabricating metadata. Surface it (never "completed").
+    if worker_result.get('status') == 'failed':
+        message = worker_result.get('message') or 'Analysis failed while processing the uploaded audio.'
+        next_action = worker_result.get('next_action') or 'Retry analysis or upload a different WAV or MP3 file.'
+        failed_analysis = AnalysisMetadata(
+            status='failed',
+            task_id=task_id,
+            message=message,
+            next_action=next_action,
+        )
+        session['analysis'] = failed_analysis.model_dump()
+        session['workflow_stages'] = [
+            {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
+            {'stage': 'analysis', 'status': 'failed', 'message': message, 'next_action': next_action},
+        ]
+        _store_session(session)
+        return JSONResponse(
+            status_code=422,
+            content=AnalyzeErrorResponse(
+                error_code='analysis_processing_failed',
+                message=message,
+                detail='Real analysis could not be computed from the uploaded audio.',
+                stage='analysis',
+                next_action=next_action,
+                workflow_stages=build_workflow_stages('failed', message),
+            ).model_dump(),
+        )
+
     completed_analysis = AnalysisMetadata(
         status='completed',
         bpm=worker_result.get('bpm'),
@@ -669,6 +698,33 @@ async def separate_audio(payload: SeparateRequest):
                 detail=str(exc),
                 stage='stem_separation',
                 next_action=failed_stems.next_action,
+                workflow_stages=workflow_stage_models(stages),
+            ).model_dump(),
+        )
+
+    # Real separation (Story 2.4) reports an honest failure through the worker
+    # result instead of fabricating byte-identical fake stems. Surface it.
+    if worker_result.get('status') == 'failed':
+        message = worker_result.get('message') or 'Stem separation failed while processing the uploaded audio.'
+        next_action = worker_result.get('next_action') or 'Retry separation or upload a different WAV or MP3 file.'
+        failed_stems = StemsMetadata(
+            status='failed',
+            task_id=task_id,
+            message=message,
+            next_action=next_action,
+        )
+        session['stems'] = failed_stems.model_dump()
+        stages = build_stage_dicts(analysis_status, analysis_message, 'failed', message, next_action)
+        session['workflow_stages'] = stages
+        _store_session(session)
+        return JSONResponse(
+            status_code=422,
+            content=SeparateErrorResponse(
+                error_code='separation_processing_failed',
+                message=message,
+                detail='Real stem separation could not produce distinct stems for the uploaded audio.',
+                stage='stem_separation',
+                next_action=next_action,
                 workflow_stages=workflow_stage_models(stages),
             ).model_dump(),
         )

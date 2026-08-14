@@ -2,6 +2,7 @@
 
 import React, { useCallback, useMemo, useState } from 'react';
 import StemTimeline from './StemTimeline';
+import { CheckCircle2, Circle, Loader2, Music, UploadCloud, XCircle } from 'lucide-react';
 
 const acceptedTypes = ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3'];
 const acceptedExtensions = ['.wav', '.mp3'];
@@ -479,7 +480,10 @@ export default function UploadPanel() {
 
       <div style={{ display: 'grid', gap: '0.75rem', padding: '1rem', borderRadius: 12, background: '#111', color: '#fff' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h2 style={{ margin: 0, fontSize: '1rem' }}>Workflow Progress</h2>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <Music size={16} aria-hidden="true" />
+            <h2 style={{ margin: 0, fontSize: '1rem' }}>Workflow Progress</h2>
+          </div>
           <span style={{ fontSize: '0.9rem', color: '#94a3b8' }}>
             {workflowStages.filter((stage) => stage.status === 'completed').length}/{workflowStages.length} completed
           </span>
@@ -625,6 +629,10 @@ export default function UploadPanel() {
                   justifySelf: 'end',
                 }}
               >
+                {stage.status === 'completed' && <CheckCircle2 size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} aria-hidden="true" />}
+                {stage.status === 'failed' && <XCircle size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} aria-hidden="true" />}
+                {stage.status === 'active' && <Loader2 size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} aria-hidden="true" />}
+                {stage.status === 'pending' && <Circle size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} aria-hidden="true" />}
                 {stage.status}
               </span>
             </div>
@@ -658,6 +666,7 @@ export default function UploadPanel() {
           cursor: selectedFile && !error ? 'pointer' : 'not-allowed',
         }}
       >
+        <UploadCloud size={18} style={{ verticalAlign: 'middle', marginRight: 6 }} aria-hidden="true" />
         Upload to backend
       </button>
 

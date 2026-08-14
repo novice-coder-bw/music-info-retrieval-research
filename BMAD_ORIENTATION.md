@@ -31,7 +31,7 @@ To move from the current implementation to a production-ready state, follow thes
 
 1. **Check Sprint Progress**: Use `bmad-sprint-status` to identify the next set of stories in your queue.
 2. **Create a "Model Integration" Story**: You can trigger a new development cycle to replace the placeholders.
-   - *Example Command*: "Let's create a story to replace the placeholder analysis logic in `workers/tasks.py` with `madmom` integration."
+   - *Example Command*: "Let's create a story to replace the placeholder analysis logic in `workers/tasks.py` with `essentia` integration."
 3. **Validate**: Once integrated, run `bmad-qa-generate-e2e-tests` to ensure the new model integration maintains the system contract.
 
 ---

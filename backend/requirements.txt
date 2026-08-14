@@ -17,26 +17,22 @@ alembic>=1.19.1
 boto3>=1.43.67
 python-dotenv>=1.0.1
 
-# Audio processing / MIR — actually used in code (workers/tasks.py)
-#   demucs (HTDemucs v4) and torch power real source separation.
+# Audio processing / MIR — actually used in code (workers/tasks.py).
+# essentia is the feature-extraction engine (BPM, key, structure); Demucs
+# (HTDemucs v4) + torch power real source separation. numpy supports loading
+# and normalizing raw audio tensors.
+essentia>=2.1b6.dev1389
 demucs>=4.0.0
 torch>=2.0.0
+numpy>=1.24.0
 
-# Audio processing / MIR — declared in techstack.md but NOT yet imported anywhere
-# in the code, so they are OPTIONAL. Kept commented so `pip install -r` stays
-# clean; uncomment individually only when you implement those features.
-#
-# NOTE on installability in this Python 3.12 environment:
-#   - essentia  has NO default-index wheel (must be built from source).
-#   - madmom    is an old package that builds from source and needs Cython;
-#               it may not build cleanly on Python 3.12.
-#   - basic-pitch pulls in the large TensorFlow dependency tree.
-#   - pyableton is pure-Python and installs fine if you uncomment it.
-#
+# Optional future MIR (NOT yet implemented in code):
+#   - basic-pitch (note detection / audio-to-MIDI) pulls in TensorFlow.
+#   - pyableton (Ableton Live export) is pure-Python.
+# essentia is the single MIR/feature-extraction engine; no extra beat-tracking
+# libraries are required.
 # basic-pitch>=0.4.0
-# madmom>=0.16.1
 # pyableton>=0.0.15
-# essentia>=2.1b6
 
 # Testing
 pytest>=8.0.0
