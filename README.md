@@ -27,7 +27,9 @@ A FastAPI + Next.js platform for music information retrieval: upload audio, anal
 The repo ships two executable scripts. Run them from the repo root.
 
 ```bash
-chmod +x startup.sh run_all.sh   # already executable, shown for safety
+
+
+ # already executable, shown for safety
 
 ./startup.sh   # install deps + start Redis (idempotent)
 ./run_all.sh   # run backend, Celery worker, and frontend together
