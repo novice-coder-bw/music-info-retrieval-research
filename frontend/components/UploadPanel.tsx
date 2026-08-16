@@ -578,7 +578,7 @@ export default function UploadPanel() {
                 <p aria-label="Stems ready for review" style={{ margin: 0, color: '#a7f3d0', fontWeight: 600 }}>
                   Stems are ready for review.
                 </p>
-                <StemTimeline stems={stemSeparation.stems ?? []} />
+                <StemTimeline stems={stemSeparation.stems ?? []} fileId={sessionMetadata?.session_id ?? null} />
               </>
             )}
             {stemSeparation.next_action && (

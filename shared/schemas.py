@@ -98,3 +98,46 @@ class SeparateErrorResponse(BaseModel):
     stage: str | None = None
     next_action: str | None = None
     workflow_stages: list[WorkflowStageStatus] | None = None
+
+
+class TimeRegion(BaseModel):
+    """A single selected time region expressed in milliseconds.
+
+    ``start_ms``/``end_ms`` are the non-negative bounds (ms) of the region on
+    the shared session timeline. ``id`` is set by the client so the UI can
+    reconcile a region set without relying on server-side identity.
+    """
+
+    id: str
+    start_ms: int
+    end_ms: int
+
+
+class RegionsMetadata(BaseModel):
+    """Region-selection state persisted on a session, mirroring analysis/stems."""
+
+    status: Literal['pending', 'active', 'completed', 'failed']
+    regions: list[TimeRegion] | None = None
+    message: str | None = None
+    next_action: str | None = None
+    updated_at: str | None = None
+
+
+class RegionsRequest(BaseModel):
+    file_id: str
+    regions: list[TimeRegion]
+
+
+class RegionsResponse(BaseModel):
+    file_id: str
+    regions: RegionsMetadata
+    workflow_stages: list[WorkflowStageStatus] | None = None
+
+
+class RegionsErrorResponse(BaseModel):
+    error_code: str
+    message: str
+    detail: str | None = None
+    stage: str | None = None
+    next_action: str | None = None
+    workflow_stages: list[WorkflowStageStatus] | None = None

@@ -851,3 +851,148 @@ def test_separate_reports_honest_failure_via_api(tmp_path, monkeypatch):
     assert data['stage'] == 'stem_separation'
     assert 'Demucs model could not be loaded' in data['message']
     assert main.SESSIONS[file_id]['stems']['status'] == 'failed'
+
+
+# --- Region selection persistence tests -------------------------------------
+
+def _seed_separated_session(tmp_path, monkeypatch):
+    """Seed a session that has completed upload, analysis, and separation."""
+    file_id = _seed_analyzed_session(tmp_path, monkeypatch)
+    response = client.post('/api/separate', json={'file_id': file_id})
+    assert response.status_code == 200
+    assert response.json()['stems']['status'] == 'completed'
+    return file_id
+
+
+def test_save_regions_success(tmp_path, monkeypatch):
+    file_id = _seed_separated_session(tmp_path, monkeypatch)
+    regions = [
+        {'id': 'region-a', 'start_ms': 0, 'end_ms': 1000},
+        {'id': 'region-b', 'start_ms': 2500, 'end_ms': 3200},
+    ]
+
+    response = client.post('/api/regions', json={'file_id': file_id, 'regions': regions})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data['file_id'] == file_id
+    assert data['regions']['status'] == 'completed'
+    assert data['regions']['regions'] == regions
+    assert data['regions']['message']
+    assert data['regions']['updated_at']
+
+    session = main.SESSIONS[file_id]
+    assert session['regions']['regions'] == regions
+    assert session['regions']['status'] == 'completed'
+
+
+def test_save_regions_missing_file_id():
+    response = client.post('/api/regions', json={'file_id': 'missing', 'regions': []})
+
+    assert response.status_code == 404
+    data = response.json()
+    assert data['error_code'] == 'regions_session_not_found'
+    assert data['next_action']
+
+
+def test_save_regions_stems_not_complete(tmp_path, monkeypatch):
+    # Only upload + analysis, no separation yet.
+    monkeypatch.setattr(main, 'UPLOAD_DIR', tmp_path)
+    file_path = tmp_path / 'raw.wav'
+    file_path.write_bytes(b'RIFF\x00\x00\x00\x00WAVEfmt ')
+    with file_path.open('rb') as file:
+        upload_response = client.post('/api/upload', files={'file': ('raw.wav', file, 'audio/wav')})
+    file_id = upload_response.json()['file_id']
+
+    response = client.post(
+        '/api/regions',
+        json={'file_id': file_id, 'regions': [{'id': 'r1', 'start_ms': 0, 'end_ms': 1000}]},
+    )
+
+    assert response.status_code == 422
+    data = response.json()
+    assert data['error_code'] == 'regions_stems_not_complete'
+    assert main.SESSIONS[file_id].get('regions') is None
+
+
+def test_save_regions_rejects_inverted_bounds(tmp_path, monkeypatch):
+    file_id = _seed_separated_session(tmp_path, monkeypatch)
+
+    response = client.post(
+        '/api/regions',
+        json={'file_id': file_id, 'regions': [{'id': 'inv', 'start_ms': 2000, 'end_ms': 1000}]},
+    )
+
+    assert response.status_code == 422
+    data = response.json()
+    assert data['error_code'] == 'regions_invalid_region'
+    assert main.SESSIONS[file_id].get('regions') is None
+
+
+def test_save_regions_rejects_out_of_bounds(tmp_path, monkeypatch):
+    file_id = _seed_separated_session(tmp_path, monkeypatch)
+    analysis = main.SESSIONS[file_id]['analysis']
+    duration_ms = int(analysis['duration'] * 1000)
+
+    response = client.post(
+        '/api/regions',
+        json={
+            'file_id': file_id,
+            'regions': [{'id': 'far', 'start_ms': 0, 'end_ms': duration_ms + 1000}],
+        },
+    )
+
+    assert response.status_code == 422
+    data = response.json()
+    assert data['error_code'] == 'regions_out_of_bounds'
+    assert main.SESSIONS[file_id].get('regions') is None
+
+
+def test_save_regions_empty_list_clears(tmp_path, monkeypatch):
+    file_id = _seed_separated_session(tmp_path, monkeypatch)
+    regions = [{'id': 'r1', 'start_ms': 0, 'end_ms': 1000}]
+    client.post('/api/regions', json={'file_id': file_id, 'regions': regions})
+
+    response = client.post('/api/regions', json={'file_id': file_id, 'regions': []})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data['regions']['regions'] == []
+    assert data['regions']['message']
+    assert main.SESSIONS[file_id]['regions']['regions'] == []
+
+
+def test_save_regions_idempotent(tmp_path, monkeypatch):
+    file_id = _seed_separated_session(tmp_path, monkeypatch)
+    regions = [{'id': 'r1', 'start_ms': 500, 'end_ms': 1400}]
+
+    first = client.post('/api/regions', json={'file_id': file_id, 'regions': regions})
+    second = client.post('/api/regions', json={'file_id': file_id, 'regions': regions})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()['regions'] == second.json()['regions']
+
+
+def test_save_regions_persists_to_store(tmp_path, monkeypatch):
+    """Region selections survive process restart through the durable store."""
+    from db import store as db_store
+
+    _configure_persistent_store(tmp_path)
+    try:
+        file_id = _seed_separated_session(tmp_path, monkeypatch)
+        regions = [{'id': 'r1', 'start_ms': 300, 'end_ms': 2200}]
+        response = client.post('/api/regions', json={'file_id': file_id, 'regions': regions})
+        assert response.status_code == 200
+
+        stored = db_store.get_session(file_id)
+        assert stored is not None
+        assert stored['regions']['regions'] == regions
+
+        # Restart simulation: in-memory cache dropped, store re-read intact.
+        main.SESSIONS.pop(file_id, None)
+        restored = main._resolve_session(file_id)
+        assert restored is not None
+        assert restored['regions']['regions'] == regions
+    finally:
+        _restore_default_store()

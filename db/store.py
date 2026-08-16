@@ -22,6 +22,7 @@ _SESSION_COLUMNS = (
     'artifact_url',
     'analysis',
     'stems',
+    'regions',
     'workflow_stages',
     'created_at',
 )

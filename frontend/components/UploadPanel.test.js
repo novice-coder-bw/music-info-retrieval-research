@@ -25,10 +25,42 @@ jest.mock('@wavesurfer/react', () => {
   };
 });
 
-jest.mock('wavesurfer.js/dist/plugins/regions', () => ({
-  __esModule: true,
-  default: { create: () => ({}) },
-}));
+jest.mock('wavesurfer.js/dist/plugins/regions', () => {
+  const createFakeRegions = () => {
+    const regions = new Map();
+    const handlers = { created: [], updated: [], removed: [] };
+    const fakeRegions = {
+      getRegions: () => regions,
+      addRegion: (opts) => {
+        const region = {
+          id: opts.id,
+          start: opts.start,
+          end: opts.end,
+          color: opts.color,
+          setOptions: (next) => {
+            if (typeof next.start === 'number') region.start = next.start;
+            if (typeof next.end === 'number') region.end = next.end;
+          },
+          remove: () => regions.delete(region.id),
+        };
+        regions.set(region.id, region);
+        return region;
+      },
+      enableDragSelection: jest.fn(),
+      on: (event, cb) => {
+        const key = event.replace('region-', '');
+        if (handlers[key]) handlers[key].push(cb);
+        return () => {};
+      },
+      clearRegions: () => regions.clear(),
+    };
+    return fakeRegions;
+  };
+  return {
+    __esModule: true,
+    default: { create: createFakeRegions },
+  };
+});
 
 describe('UploadPanel', () => {
   it('renders workflow progress panel and upload controls', () => {
@@ -363,5 +395,69 @@ describe('UploadPanel', () => {
     const drumsButton = screen.getByLabelText('Play drums');
     fireEvent.keyDown(drumsButton, { key: ' ' });
     expect(screen.getByLabelText('Pause drums')).toBeInTheDocument();
+  });
+
+  it('shows region summary, adds a region, and removes it via keyboard', async () => {
+    const uploadResponse = {
+      file_id: 'abc-456',
+      filename: 'track.wav',
+      content_type: 'audio/wav',
+      size: 100,
+      artifact_url: '/uploads/track.wav',
+      workflow_stages: [
+        { stage: 'upload', status: 'completed', message: 'Upload completed successfully.' },
+        { stage: 'analysis', status: 'pending', message: 'Analysis has not started yet.' },
+      ],
+    };
+
+    let sessionFetchCount = 0;
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => {
+        // Region restore hits the session GET; return an empty selection.
+        sessionFetchCount += 1;
+        return { regions: null };
+      },
+    });
+
+    const xhrMock = {
+      open: jest.fn(),
+      send: jest.fn(function send() {
+        Object.defineProperty(this, 'status', { value: 200, configurable: true });
+        Object.defineProperty(this, 'responseText', { value: JSON.stringify(uploadResponse), configurable: true });
+        if (typeof this.onload === 'function') {
+          this.onload();
+        }
+      }),
+      upload: { onprogress: null },
+      setRequestHeader: jest.fn(),
+    };
+    jest.spyOn(global, 'XMLHttpRequest').mockImplementation(() => xhrMock);
+
+    render(<UploadPanel />);
+
+    const fileInput = screen.getByLabelText(/upload audio/i);
+    const audioFile = new File(['RIFF....WAVE'], 'track.wav', { type: 'audio/wav' });
+    fireEvent.change(fileInput, { target: { files: [audioFile] } });
+
+    fireEvent.click(screen.getByRole('button', { name: /Upload to backend/i }));
+
+    const summary = await screen.findByLabelText('Region selection summary');
+    expect(summary).toBeInTheDocument();
+    expect(screen.getByText('0 regions · 0:00 selected')).toBeInTheDocument();
+
+    // Keyboard path comes from the region element itself, but the add button is
+    // the accessible way to create a region when drag selection is unavailable.
+    const addButton = screen.getByRole('button', { name: 'Add region' });
+    fireEvent.click(addButton);
+    expect(screen.getByText('1 region · 0:01 selected')).toBeInTheDocument();
+
+    const regionItem = screen.getByLabelText(/Region 1, 0:00 to 0:01/);
+    expect(regionItem).toBeInTheDocument();
+
+    // Delete key removes the focused region.
+    fireEvent.keyDown(regionItem, { key: 'Delete' });
+    expect(screen.getByText('0 regions · 0:00 selected')).toBeInTheDocument();
+    expect(sessionFetchCount).toBeGreaterThan(0);
   });
 });

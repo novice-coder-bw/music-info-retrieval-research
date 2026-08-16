@@ -13,6 +13,14 @@ type StemArtifact = {
   mime_type?: string | null;
 };
 
+type SelectedRegion = {
+  id: string;
+  start: number; // seconds
+  end: number; // seconds
+};
+
+type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
+
 // The backend serves audio under /uploads/... on a DIFFERENT origin than the
 // frontend. To stay same-origin (no CORS) and reuse the proxy-route pattern,
 // route stem audio through the Next.js /api/uploads proxy.
@@ -27,6 +35,11 @@ function formatTime(seconds: number): string {
   const secs = Math.floor(seconds % 60);
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
+
+const REGION_FILL = 'rgba(56, 189, 248, 0.18)';
+const REGION_BORDER = '#38bdf8';
+const REGION_STEP_SECONDS = 0.25;
+const SAVE_DEBOUNCE_MS = 500;
 
 type PlaybackWaveProps = {
   url: string;
@@ -169,22 +182,185 @@ function StemRow({ stem, plugins, callbacks, isActive, hasError }: StemRowProps)
   );
 }
 
-export default function StemTimeline({ stems }: { stems: StemArtifact[] }) {
+export default function StemTimeline({ stems, fileId }: { stems: StemArtifact[]; fileId?: string | null }) {
   const [mounted, setMounted] = useState(false);
   const [activeStem, setActiveStem] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, boolean>>({});
+
+  // --- Region selection state (Story 3.2) ---
+  const [regions, setRegions] = useState<SelectedRegion[]>([]);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  // Refs
   const wavesurferMap = useRef<Map<string, any>>(new Map());
   const wsToName = useRef<WeakMap<object, string>>(new WeakMap());
   const callbacksByStem = useRef<Map<string, StemCallbacks>>(new Map());
+  const regionPluginsRef = useRef<Map<string, any>>(new Map());
+  const wiredRef = useRef<Set<string>>(new Set());
+  const regionsRef = useRef<SelectedRegion[]>([]);
+  const syncingRef = useRef(false);
+  const saveTimerRef = useRef<number | null>(null);
+  const durationRef = useRef(0);
 
   useEffect(() => {
     setMounted(true);
   }, []);
 
+  // Restore regions on mount (process restart persistence)
+  useEffect(() => {
+    if (!fileId) return;
+    let cancelled = false;
+    fetch(`/api/session/${encodeURIComponent(fileId)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((session) => {
+        if (cancelled || !session) return;
+        const stored = session.regions?.regions;
+        if (!Array.isArray(stored) || stored.length === 0) return;
+        const loaded: SelectedRegion[] = stored
+          .filter((r: any) => typeof r?.start_ms === 'number' && typeof r?.end_ms === 'number')
+          .map((r: any) => ({
+            id: typeof r.id === 'string' ? r.id : `region-${r.start_ms}-${r.end_ms}`,
+            start: r.start_ms / 1000,
+            end: r.end_ms / 1000,
+          }));
+        if (loaded.length > 0) {
+          regionsRef.current = loaded;
+          setRegions(loaded);
+          applyRegionsToPatches(loaded);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [fileId]);
+
+  // Apply regions to all wave surfer instances
+  const applyRegionsToPatches = useCallback((next: SelectedRegion[]) => {
+    regionPluginsRef.current.forEach((plugin) => {
+      if (!plugin || typeof plugin.getRegions !== 'function') return;
+      let existing: any;
+      try {
+        existing = plugin.getRegions();
+      } catch {
+        return;
+      }
+      const seen = new Set<string>();
+      next.forEach((region) => {
+        seen.add(region.id);
+        const current = existing.get ? existing.get(region.id) : undefined;
+        if (!current) {
+          if (typeof plugin.addRegion === 'function') {
+            plugin.addRegion({
+              id: region.id,
+              start: region.start,
+              end: region.end,
+              color: REGION_FILL,
+              drag: true,
+              resize: true,
+              minLength: 0.1,
+            });
+          }
+        } else if (
+          Math.abs(current.start - region.start) > 0.001 ||
+          Math.abs(current.end - region.end) > 0.001
+        ) {
+          if (typeof current.setOptions === 'function') {
+            current.setOptions({ start: region.start, end: region.end });
+          }
+        }
+      });
+      if (typeof existing.forEach === 'function') {
+        const toRemove: string[] = [];
+        existing.forEach((reg: any) => {
+          if (!seen.has(reg.id)) toRemove.push(reg.id);
+        });
+        toRemove.forEach((id) => {
+          const reg = existing.get ? existing.get(id) : undefined;
+          if (reg && typeof reg.remove === 'function') reg.remove();
+        });
+      }
+    });
+  }, []);
+
+  const wirePlugin = useCallback(
+    (name: string) => {
+      const plugin = regionPluginsRef.current.get(name);
+      if (!plugin || wiredRef.current.has(name)) return;
+      wiredRef.current.add(name);
+      if (typeof plugin.enableDragSelection === 'function') {
+        try {
+          plugin.enableDragSelection({ color: REGION_FILL });
+        } catch {
+          // drag-to-create is progressive enhancement
+        }
+      }
+      if (typeof plugin.on === 'function') {
+        plugin.on('region-created', (region: any) => {
+          if (syncingRef.current) return;
+          const current = regionsRef.current;
+          if (!current.some((r) => r.id === region.id)) {
+            const next = [...current, { id: region.id, start: Number(region.start ?? 0), end: Number(region.end ?? 0) }];
+            regionsRef.current = next;
+            setRegions(next);
+          }
+        });
+        plugin.on('region-updated', (region: any) => {
+          if (syncingRef.current) return;
+          const current = regionsRef.current;
+          const next = current.map((r) =>
+            r.id === region.id ? { ...r, start: Number(region.start ?? 0), end: Number(region.end ?? 0) } : r,
+          );
+          regionsRef.current = next;
+          setRegions(next);
+        });
+        plugin.on('region-removed', (region: any) => {
+          if (syncingRef.current) return;
+          const current = regionsRef.current;
+          const next = current.filter((r) => r.id !== region.id);
+          regionsRef.current = next;
+          setRegions(next);
+        });
+      }
+    }, []);
+
+  const persistRegions = useCallback(async (next: SelectedRegion[]) => {
+    if (!fileId) return;
+    try {
+      await fetch(`/api/session/${encodeURIComponent(fileId)}/regions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          regions: next.map((region) => ({
+            id: region.id,
+            start_ms: Math.round(region.start * 1000),
+            end_ms: Math.round(region.end * 1000),
+          })),
+        }),
+      });
+    } catch {
+      // background save - non-blocking
+    }
+  }, [fileId]);
+
+  // Debounce and persist regions
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      persistRegions(regions);
+    }, SAVE_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [regions, persistRegions]);
+
   const stemPluginArrays = useMemo(() => {
     const map = new Map<string, any[]>();
     stems.forEach((stem) => {
-      if (!map.has(stem.name)) map.set(stem.name, [RegionsPlugin.create()]);
+      let plugin = regionPluginsRef.current.get(stem.name);
+      if (!plugin) {
+        plugin = RegionsPlugin.create();
+        regionPluginsRef.current.set(stem.name, plugin);
+      }
+      map.set(stem.name, [plugin]);
     });
     return map;
   }, [stems]);
@@ -201,6 +377,7 @@ export default function StemTimeline({ stems }: { stems: StemArtifact[] }) {
         wavesurferMap.current.set(name, ws);
         wsToName.current.set(ws, name);
         setErrors((prev) => (prev[name] ? { ...prev, [name]: false } : prev));
+        wirePlugin(name);
       },
       onPlay: () => {
         wavesurferMap.current.forEach((otherWs, otherName) => {
@@ -295,6 +472,73 @@ export default function StemTimeline({ stems }: { stems: StemArtifact[] }) {
           hasError={!!errors[stem.name]}
         />
       ))}
+
+      {/* Region selection UI (Story 3.2) */}
+      <section
+        aria-label="Region selection"
+        style={{
+          display: 'grid',
+          gap: '0.5rem',
+          padding: '0.9rem',
+          borderRadius: 10,
+          background: '#111827',
+          border: `1px solid ${regions.length > 0 ? '#38bdf8' : '#334155'}`,
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <strong style={{ color: '#f8fafc' }}>Selected Regions</strong>
+          <span aria-label="Region summary" style={{ color: '#94a3b8', fontSize: '0.85rem' }}>
+            {regions.length} region{regions.length === 1 ? '' : 's'} · {formatTime(regions.reduce((s, r) => s + (r.end - r.start), 0))} selected
+          </span>
+        </div>
+
+        {regions.length > 0 && (
+          <ul aria-label="Region list" style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: '0.25rem' }}>
+            {regions.map((region, index) => {
+              const label = `Region ${index + 1}, ${formatTime(region.start)} to ${formatTime(region.end)}`;
+              return (
+                <li key={region.id}>
+                  <div
+                    role="region"
+                    tabIndex={0}
+                    aria-label={`${label}. Use arrow keys to nudge, Delete to remove.`}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Delete' || e.key === 'Backspace') {
+                        e.preventDefault();
+                        setRegions((prev) => prev.filter((r) => r.id !== region.id));
+                      }
+                      if (e.key === 'ArrowLeft') {
+                        e.preventDefault();
+                        setRegions((prev) =>
+                          prev.map((r) => r.id === region.id ? { ...r, start: Math.max(0, r.start - 0.25) } : r),
+                        );
+                      }
+                      if (e.key === 'ArrowRight') {
+                        e.preventDefault();
+                        setRegions((prev) =>
+                          prev.map((r) => r.id === region.id ? { ...r, end: r.end + 0.25 } : r),
+                        );
+                      }
+                    }}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      padding: '0.45rem 0.6rem',
+                      borderRadius: 8,
+                      background: '#0f172a',
+                      border: '1px solid #334155',
+                    }}
+                  >
+                    <span style={{ color: '#e2e8f0', fontSize: '0.85rem' }}>{label}</span>
+                    <span style={{ color: '#64748b', fontSize: '0.75rem' }}>{formatTime(region.end - region.start)}</span>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
     </div>
   );
 }

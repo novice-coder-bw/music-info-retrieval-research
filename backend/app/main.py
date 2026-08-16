@@ -18,6 +18,10 @@ from shared.schemas import (
     AnalyzeRequest,
     AnalyzeResponse,
     AnalysisMetadata,
+    RegionsErrorResponse,
+    RegionsRequest,
+    RegionsResponse,
+    RegionsMetadata,
     SeparateErrorResponse,
     SeparateRequest,
     SeparateResponse,
@@ -772,3 +776,144 @@ async def separate_audio(payload: SeparateRequest):
     _store_session(session)
 
     return JSONResponse(build_separation_response(session['file_id'], completed_stems))
+
+
+def build_regions_response(file_id: str, regions_meta: RegionsMetadata, stages: list[dict]) -> dict:
+    """Build the region-save response, echoing the current workflow stages."""
+    return RegionsResponse(
+        file_id=file_id,
+        regions=regions_meta,
+        workflow_stages=workflow_stage_models(stages),
+    ).model_dump()
+
+
+def _session_duration_ms(session: dict) -> int | None:
+    """Return the session's track duration in ms, or None when unknown."""
+    analysis = session.get('analysis') or {}
+    duration = analysis.get('duration')
+    if duration is None:
+        return None
+    try:
+        return max(0, int(float(duration) * 1000))
+    except (TypeError, ValueError):
+        return None
+
+
+@app.post('/api/regions', response_model=RegionsResponse)
+async def save_regions(payload: RegionsRequest):
+    """Persist the full selected-region set for a session (stateless, sync).
+
+    Replaces any previously stored regions; an empty list clears the selection.
+    Regions are plain ``[start_ms, end_ms]`` pairs bounded by the track duration.
+    """
+    session = _resolve_session(payload.file_id)
+    if not session:
+        stages = build_stage_dicts('pending', 'Analysis has not started yet.')
+        return JSONResponse(
+            status_code=404,
+            content=RegionsErrorResponse(
+                error_code='regions_session_not_found',
+                message='Region selection could not be saved because the session was not found.',
+                detail='No upload session exists for the supplied file_id.',
+                stage='region_selection',
+                next_action='Upload the audio file again and re-select the regions you want to transcribe.',
+                workflow_stages=workflow_stage_models(stages),
+            ).model_dump(),
+        )
+
+    stems = session.get('stems') or {}
+    analysis = session.get('analysis') or {}
+    analysis_status = analysis.get('status', 'pending')
+    stems_status = stems.get('status', 'pending')
+    if analysis_status == 'completed':
+        analysis_message = analysis.get('message') or 'Analysis completed successfully.'
+    else:
+        analysis_message = analysis.get('message') or 'Analysis has not been completed yet.'
+    if stems_status == 'completed':
+        stems_message = stems.get('message') or 'Stem separation completed successfully.'
+    else:
+        stems_message = stems.get('message') or 'Stem separation is not complete yet.'
+
+    if stems_status != 'completed':
+        stages = build_stage_dicts(
+            analysis_status,
+            analysis_message,
+            'failed',
+            'Region selection cannot be saved before stem separation completes.',
+            'Run stem separation first, then select regions for transcription.',
+        )
+        return JSONResponse(
+            status_code=422,
+            content=RegionsErrorResponse(
+                error_code='regions_stems_not_complete',
+                message='Region selection requires completed stems; stem separation has not finished.',
+                detail='Stems must be available on the timeline before regions can be selected.',
+                stage='region_selection',
+                next_action='Wait for stem separation to complete, then select your regions.',
+                workflow_stages=workflow_stage_models([s for s in stages if s['stage'] != 'stem_separation']),
+            ).model_dump(),
+        )
+
+    duration_ms = _session_duration_ms(session)
+    for region in payload.regions:
+        if region.start_ms < 0 or region.end_ms <= region.start_ms:
+            stages = build_stage_dicts(
+                analysis_status,
+                analysis_message,
+                stems_status,
+                stems_message,
+            )
+            return JSONResponse(
+                status_code=422,
+                content=RegionsErrorResponse(
+                    error_code='regions_invalid_region',
+                    message='A region must have a positive duration (start_ms < end_ms).',
+                    detail=f"Region '{region.id}' has start_ms={region.start_ms}, end_ms={region.end_ms}.",
+                    stage='region_selection',
+                    next_action='Adjust the region bounds so the end is strictly after the start.',
+                    workflow_stages=workflow_stage_models(stages),
+                ).model_dump(),
+            )
+        if duration_ms is not None and region.end_ms > duration_ms:
+            stages = build_stage_dicts(
+                analysis_status,
+                analysis_message,
+                stems_status,
+                stems_message,
+            )
+            return JSONResponse(
+                status_code=422,
+                content=RegionsErrorResponse(
+                    error_code='regions_out_of_bounds',
+                    message='A region cannot extend beyond the end of the track.',
+                    detail=f"Region '{region.id}' ends at {region.end_ms}ms but the track is {duration_ms}ms.",
+                    stage='region_selection',
+                    next_action='Move or shrink the region so it fits within the track length.',
+                    workflow_stages=workflow_stage_models(stages),
+                ).model_dump(),
+            )
+
+    if payload.regions:
+        message = f'Saved {len(payload.regions)} region(s) for transcription.'
+    else:
+        message = 'All selected regions have been cleared.'
+
+    existing_regions = (session.get('regions') or {}).get('regions') or []
+    incoming_regions = [region.model_dump() for region in payload.regions]
+    if existing_regions == incoming_regions and session.get('regions'):
+        # Identical selection re-save: keep the stored metadata untouched so a
+        # retried save is idempotent (stable message + updated_at).
+        regions_meta = RegionsMetadata.model_validate(session['regions'])
+    else:
+        regions_meta = RegionsMetadata(
+            status='completed',
+            regions=payload.regions,
+            message=message,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+    session['regions'] = regions_meta.model_dump()
+    stages = build_stage_dicts(analysis_status, analysis_message, stems_status, stems_message)
+    session['workflow_stages'] = stages
+    _store_session(session)
+
+    return JSONResponse(build_regions_response(payload.file_id, regions_meta, stages))
