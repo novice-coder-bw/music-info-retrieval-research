@@ -23,6 +23,20 @@ except ImportError:
 
 logger = logging.getLogger('workers.tasks')
 
+# Import demucs/torch at module level for reuse; fall back gracefully if unavailable
+try:
+    import torch
+    from demucs.apply import apply_model
+    DEMUCS_AVAILABLE = True
+except ImportError:
+    DEMUCS_AVAILABLE = False
+
+try:
+    import essentia.standard as es
+    ESSENTIA_AVAILABLE = True
+except ImportError:
+    ESSENTIA_AVAILABLE = False
+
 
 def broker_reachable(timeout: float = 1.0) -> bool:
     """Return True quickly if the Redis broker accepts TCP connections.
@@ -211,9 +225,12 @@ def _available_demucs_model():
         from demucs.pretrained import get_model
 
         return get_model('htdemucs')
-    except Exception as exc:
-        logger.warning('Demucs model is unavailable: %s', exc)
+    except ImportError as exc:
+        logger.warning('Demucs model import failed: %s', exc)
         return None
+    except Exception as exc:
+        logger.error('Unexpected error loading Demucs model: %s', exc)
+        raise
 
 
 def _load_mix(file_path: str, samplerate: int, channels: int):
@@ -222,9 +239,16 @@ def _load_mix(file_path: str, samplerate: int, channels: int):
     essentia (which bundles its own libav-based decoder) is used instead of
     Demucs' ``AudioFile`` so WAV/MP3 reading works without a system
     ``ffmpeg``/``ffprobe`` binary. Mono input is duplicated across channels.
+
+    Raises RuntimeError if essentia is not available.
     """
     import numpy as np
-    import essentia.standard as es
+
+    if not ESSENTIA_AVAILABLE:
+        raise RuntimeError(
+            'essentia is not installed; cannot load audio file'
+            ' Install essentia to enable audio loading.'
+        )
 
     mono = np.asarray(es.MonoLoader(filename=file_path, sampleRate=samplerate)(), dtype='float32')
     if channels == 1:
@@ -291,8 +315,8 @@ def _demucs_apply_chunked(model, wav_norm, device, max_segment: float):
     ``apply_model(split=False)`` per chunk, overlap-adding the per-stem
     outputs with a half-overlap crossfade to avoid boundary clicks.
     """
-    import torch
-    from demucs.apply import apply_model
+    if not DEMUCS_AVAILABLE:
+        raise RuntimeError('Demucs is not available. Install demucs and torch.')
 
     channels = wav_norm.shape[0]
     n_sources = len(model.sources)
@@ -314,6 +338,15 @@ def _demucs_apply_chunked(model, wav_norm, device, max_segment: float):
     overlap = min(chunk // 4, max_len)
     overlap = overlap or 1
     step = chunk - overlap
+    if step <= 0:
+        # Fallback: process in one go if chunk/overlap logic produces invalid step
+        with torch.no_grad():
+            out = apply_model(
+                model, torch.from_numpy(wav_norm)[None], device=device,
+                shifts=0, split=False, progress=False,
+            )[0]
+        return out
+
     acc = torch.zeros(n_sources, channels, total, device=device)
     weight = torch.zeros(total, device=device)
     offset = 0
@@ -356,6 +389,14 @@ def _separate_with_demucs(file_id: str, file_path: str, stems_dir: Path) -> dict
     """
     import numpy as np
 
+    # Validate input file exists
+    if not Path(file_path).exists():
+        return _separation_failure(
+            file_id,
+            f'Input file does not exist: {file_path}',
+            'Confirm the file path is correct and the file has not been moved or deleted.',
+        )
+
     model = _available_demucs_model()
     if model is None:
         return _separation_failure(
@@ -373,15 +414,19 @@ def _separate_with_demucs(file_id: str, file_path: str, stems_dir: Path) -> dict
         model = model.to(device)
 
         channels = int(getattr(model, 'audio_channels', 2))
-        wav = _load_mix(str(file_path), int(model.samplerate), channels).astype('float32')
+        samplerate = int(getattr(model, "samplerate", 44100))
+        wav = _load_mix(str(file_path), samplerate, channels).astype('float32')
+        if wav.ndim != 2:
+            raise ValueError(f'Expected 2D audio tensor (channels, samples), got {wav.ndim}D tensor')
         if wav.shape[1] == 0:
             raise ValueError('No audio samples could be decoded from the uploaded file.')
 
-        ref = wav.mean(0)
-        std = float(ref.std())
+        # Normalize audio to zero mean and unit variance across all samples
+        ref = float(wav.mean())
+        std = float(wav.std())
         if not np.isfinite(std) or std == 0.0:
             std = 1.0
-        wav_norm = (wav - ref.mean()) / std
+        wav_norm = (wav - ref) / std
 
         # Bound CPU memory/time for long tracks by chunking the mix and applying
         # the model (split=False) per chunk, then overlap-adding the per-stem
@@ -393,26 +438,7 @@ def _separate_with_demucs(file_id: str, file_path: str, stems_dir: Path) -> dict
         sources_wav = _demucs_apply_chunked(
             model, wav_norm, device, max_segment=SPLIT_SEGMENT_SECONDS
         )
-        sources_wav = sources_wav.cpu().numpy() * std + ref.mean()
-
-        stems_dir = Path(stems_dir)
-        stems_dir.mkdir(parents=True, exist_ok=True)
-        out = []
-        for source, source_wav in zip(model.sources, sources_wav):
-            stem_path = stems_dir / f'{source}.wav'
-            _write_wav(stem_path, source_wav, int(model.samplerate))
-            out.append({
-                'name': source,
-                'filename': stem_path.name,
-                'size': stem_path.stat().st_size,
-                'format': 'wav',
-            })
-        return {
-            'file_id': file_id,
-            'status': 'completed',
-            'stems': out,
-            'separated_at': datetime.now(timezone.utc).isoformat(),
-        }
+        sources_wav = sources_wav.cpu().numpy() * std + ref
     except Exception as exc:
         logger.warning('Real Demucs separation failed for %s: %s', file_path, exc)
         return _separation_failure(
@@ -420,6 +446,33 @@ def _separate_with_demucs(file_id: str, file_path: str, stems_dir: Path) -> dict
             f'Real stem separation failed while applying the Demucs model: {exc}',
             'Retry separation with a valid WAV or MP3 file and confirm the Demucs model weights are available.',
         )
+
+    # Verify sources_wav has the expected number of sources
+    if sources_wav.shape[0] != len(model.sources):
+        return _separation_failure(
+            file_id,
+            f'Demucs returned {sources_wav.shape[0]} stem(s), expected {len(model.sources)}. The model or audio may be corrupted.',
+            'Retry separation with a different audio file or check the Demucs model installation.',
+        )
+
+    stems_dir = Path(stems_dir)
+    stems_dir.mkdir(parents=True, exist_ok=True)
+    out = []
+    for source, source_wav in zip(model.sources, sources_wav):
+        stem_path = stems_dir / f'{source}.wav'
+        _write_wav(stem_path, source_wav, samplerate)
+        out.append({
+            'name': source,
+            'filename': stem_path.name,
+            'size': stem_path.stat().st_size,
+            'format': 'wav',
+        })
+    return {
+        'file_id': file_id,
+        'status': 'completed',
+        'stems': out,
+        'separated_at': datetime.now(timezone.utc).isoformat(),
+    }
 
 def separate_stems(file_id: str, file_path: str, stems_dir: Path) -> dict:
     """Separate audio into four discrete stems with real HTDemucs v4.
@@ -429,7 +482,8 @@ def separate_stems(file_id: str, file_path: str, stems_dir: Path) -> dict:
     """
     result = _separate_with_demucs(file_id, file_path, Path(stems_dir))
     if result.get('status') == 'completed':
-        result['method'] = 'demucs'
+        # Return a new dict with method added to avoid mutating the original
+        return {**result, 'method': 'demucs'}
     return result
 
 
