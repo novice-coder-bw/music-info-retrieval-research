@@ -69,6 +69,9 @@ class StemArtifact(BaseModel):
     size: int | None = None
     format: str | None = None
     mime_type: str | None = None
+    # Pre-computed waveform peaks for instant rendering in WaveSurfer
+    peaks: list[list[float]] | None = None
+    duration: float | None = None
 
 
 class StemsMetadata(BaseModel):

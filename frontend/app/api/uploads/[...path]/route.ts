@@ -30,6 +30,8 @@ export async function GET(
     headers: upstreamHeaders,
   });
 
+  const responseBody = await response.arrayBuffer();
+
   const headers = new Headers();
   const contentType = response.headers.get('content-type');
   if (contentType) {
@@ -52,11 +54,7 @@ export async function GET(
   // from the HTTP cache instead of re-fetching across the proxy hop.
   headers.set('cache-control', 'public, max-age=3153603, immutable');
 
-  // Stream the body through instead of eagerly buffering the entire file into
-  // server memory via `response.arrayBuffer()`. This removes a full in-memory
-  // copy of every stem on this server and lets the client begin receiving
-  // bytes while the backend is still transferring the rest.
-  return new NextResponse(response.body, {
+  return new NextResponse(responseBody, {
     status: response.status,
     headers,
   });

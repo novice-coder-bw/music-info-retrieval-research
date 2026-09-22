@@ -11,6 +11,9 @@ type StemArtifact = {
   size?: number | null;
   format?: string | null;
   mime_type?: string | null;
+  // Pre-computed waveform peaks for instant rendering (WaveSurfer v7)
+  peaks?: (number[] | Float32Array)[];
+  duration?: number;
 };
 
 type SelectedRegion = {
@@ -44,6 +47,8 @@ const SAVE_DEBOUNCE_MS = 500;
 type PlaybackWaveProps = {
   url: string;
   plugins: any[];
+  peaks?: (number[] | Float32Array)[];
+  duration?: number;
   onReady: (ws: any) => void;
   onPlay: (ws: any) => void;
   onPause: (ws: any) => void;
@@ -57,6 +62,8 @@ type PlaybackWaveProps = {
 const PlaybackWave = React.memo(function PlaybackWave({
   url,
   plugins,
+  peaks,
+  duration,
   onReady,
   onPlay,
   onPause,
@@ -68,6 +75,8 @@ const PlaybackWave = React.memo(function PlaybackWave({
     <div style={{ borderRadius: 6, overflow: 'hidden', minHeight: 80 }}>
       <WavesurferPlayer
         url={url}
+        peaks={peaks}
+        duration={duration}
         height={80}
         waveColor="#334155"
         progressColor="#38bdf8"
@@ -170,6 +179,8 @@ function StemRow({ stem, plugins, callbacks, isActive, hasError }: StemRowProps)
       )}
       <PlaybackWave
         url={resolveAudioUrl(stem.url)}
+        peaks={stem.peaks}
+        duration={stem.duration}
         plugins={plugins}
         onReady={callbacks.onReady}
         onPlay={callbacks.onPlay}

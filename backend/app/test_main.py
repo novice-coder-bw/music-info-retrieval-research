@@ -86,11 +86,21 @@ def _fake_real_stems(file_id, file_path, stems_dir):
         ) + b'data' + struct.pack('<I', 4) + bytes([(len(source_bytes) + i) % 251] * 18)
         stem_path = stems_dir / f'{name}.wav'
         stem_path.write_bytes(payload)
-        out.append({'name': name, 'filename': stem_path.name, 'size': stem_path.stat().st_size, 'format': 'wav'})
+        # Add pre-computed peaks for instant waveform rendering (hermetic stub)
+        # Duration is 4 bytes / 8000 Hz sample_rate = 0.0005 sec (stub value)
+        out.append({
+            'name': name,
+            'filename': stem_path.name,
+            'peaks': [[0.5] * 128],  # minimal 1-channel peaks (128 points)
+            'duration': 0.0005,
+            'size': stem_path.stat().st_size,
+            'format': 'wav',
+        })
     return {
         'file_id': file_id,
         'status': 'completed',
         'stems': out,
+        'method': 'demo',  # matches real demucs flow
         'separated_at': datetime.now(timezone.utc).isoformat(),
     }
 

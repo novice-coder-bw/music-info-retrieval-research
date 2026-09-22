@@ -100,6 +100,49 @@ def _derive_structure(beats, duration: float | None) -> list[str]:
     return ['intro'] + needed[: n_sections - 2] + ['outro']
 
 
+def _compute_peaks(samples, max_points: int = 1024) -> list[list[float]]:
+    """Compute pre-computed waveform peaks from (channels, samples) float32 audio.
+
+    Returns a list of per-channel peak arrays, formatted for WaveSurfer.js
+    pre-computed peaks: each inner array contains the maximum absolute amplitude
+    per downsampled bin, in the -1..1 range. The renderer normalizes internally,
+    so these are raw amplitude values.
+
+    This lets the frontend render instant waveforms by passing ``peaks`` +
+    ``duration`` to WaveSurferPlayer, bypassing the full audio decode.
+    """
+    import numpy as np
+
+    samples = np.asarray(samples, dtype='float32')
+    if samples.ndim == 1:
+        samples = samples[None, :]  # (1, n)
+    channels, n_samples = samples.shape
+
+    # Downsample to max_points by averaging over bins, taking the max absolute value
+    # in each bin. This matches WaveSurfer's exportPeaks() algorithm.
+    points_per_channel = min(max_points, n_samples)
+    if n_samples <= points_per_channel:
+        # No downsampling needed; return as-is
+        peaks = samples.tolist()
+    else:
+        bin_size = n_samples / points_per_channel
+        peaks_data = []
+        for ch in range(channels):
+            channel = samples[ch]
+            peaks_list = []
+            for i in range(points_per_channel):
+                start = int(i * bin_size)
+                end = int((i + 1) * bin_size)
+                bin_slice = channel[start:end]
+                # Take the maximum absolute value in this bin
+                max_val = float(np.max(np.abs(bin_slice))) if len(bin_slice) > 0 else 0.0
+                peaks_list.append(max_val)
+            peaks_data.append(peaks_list)
+        peaks = peaks_data
+
+    return peaks
+
+
 def _compute_key(audio) -> tuple[str, str | None]:
     """Streaming essentia HPCP -> Key pipeline (krumhansl tonal profiles)."""
     import numpy as np
@@ -461,9 +504,16 @@ def _separate_with_demucs(file_id: str, file_path: str, stems_dir: Path) -> dict
     for source, source_wav in zip(model.sources, sources_wav):
         stem_path = stems_dir / f'{source}.wav'
         _write_wav(stem_path, source_wav, samplerate)
+
+        # Compute pre-computed peaks for instant waveform rendering
+        peaks = _compute_peaks(source_wav)
+        duration = float(source_wav.shape[1]) / samplerate
+
         out.append({
             'name': source,
             'filename': stem_path.name,
+            'peaks': peaks,
+            'duration': duration,
             'size': stem_path.stat().st_size,
             'format': 'wav',
         })

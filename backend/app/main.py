@@ -742,6 +742,7 @@ async def separate_audio(payload: SeparateRequest):
             content_type=mime_for_extension(stem.get('format')),
             local_url=stem_local_url,
         )
+
         _store_artifact({
             'file_id': session['file_id'],
             'name': stem['filename'],
@@ -760,6 +761,8 @@ async def separate_audio(payload: SeparateRequest):
                 size=stem.get('size'),
                 format=stem.get('format'),
                 mime_type=mime_for_extension(stem.get('format')),
+                peaks=stem.get('peaks'),
+                duration=stem.get('duration'),
             )
         )
     completed_stems = StemsMetadata(
