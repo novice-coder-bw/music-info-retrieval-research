@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import WavesurferPlayer from '@wavesurfer/react';
+import { useWavesurfer } from '@wavesurfer/react';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions';
 import { Pause, Play } from 'lucide-react';
 
@@ -57,8 +57,9 @@ type PlaybackWaveProps = {
   onError: (err: any) => void;
 };
 
-// Memoized so a per-tick time update never re-renders / re-subscribes the
-// underlying WaveSurfer instance while a stem is playing.
+// Memoized so a per-tick time update never re-subscribes / re-creates the
+// underlying WaveSurfer instance while a stem is playing (the timeupdate
+// subscription re-renders this component, but its options are unchanged).
 const PlaybackWave = React.memo(function PlaybackWave({
   url,
   plugins,
@@ -71,26 +72,49 @@ const PlaybackWave = React.memo(function PlaybackWave({
   onTimeupdate,
   onError,
 }: PlaybackWaveProps) {
-  return (
-    <div style={{ borderRadius: 6, overflow: 'hidden', minHeight: 80 }}>
-      <WavesurferPlayer
-        url={url}
-        peaks={peaks}
-        duration={duration}
-        height={80}
-        waveColor="#334155"
-        progressColor="#38bdf8"
-        cursorColor="#38bdf8"
-        plugins={plugins}
-        onReady={onReady}
-        onPlay={onPlay}
-        onPause={onPause}
-        onTimeupdate={onTimeupdate}
-        onFinish={onFinish}
-        onError={onError}
-      />
-    </div>
-  );
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // `useWavesurfer` hands back the live instance as component state, so this
+  // component can register it deterministically and re-render without
+  // re-creating it. That matters because the instance must NOT be discovered
+  // via the `ready` event: when pre-computed `peaks` + `duration` are supplied
+  // (the fast-path the worker feeds us), `load()` never awaits any I/O, so
+  // WaveSurfer emits `ready` in the same microtask chain as `create()` — before
+  // a listener attached on a later render could exist. Relying on `onReady`
+  // alone left the timeline without a playable instance, so pressing Play did
+  // nothing at all.
+  const { wavesurfer } = useWavesurfer({
+    container: containerRef,
+    url,
+    peaks,
+    duration,
+    height: 80,
+    waveColor: '#334155',
+    progressColor: '#38bdf8',
+    cursorColor: '#38bdf8',
+    plugins,
+  });
+
+  // `useWavesurfer` does not auto-subscribe the `onXxx` props the way
+  // `WavesurferPlayer` does, so the stem's playback callbacks are wired here.
+  // `onReady` is invoked both eagerly (as soon as the instance exists) and on
+  // the `ready` event; the handler is idempotent, and this keeps instance
+  // registration independent of event timing in either direction.
+  useEffect(() => {
+    if (!wavesurfer) return;
+    onReady(wavesurfer);
+    const unsubscribes = [
+      wavesurfer.on('ready', () => onReady(wavesurfer)),
+      wavesurfer.on('play', () => onPlay(wavesurfer)),
+      wavesurfer.on('pause', () => onPause(wavesurfer)),
+      wavesurfer.on('finish', () => onFinish(wavesurfer)),
+      wavesurfer.on('timeupdate', (time: number) => onTimeupdate(wavesurfer, time)),
+      wavesurfer.on('error', (err: unknown) => onError(err)),
+    ];
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [wavesurfer, onReady, onPlay, onPause, onFinish, onTimeupdate, onError]);
+
+  return <div ref={containerRef} style={{ borderRadius: 6, overflow: 'hidden', minHeight: 80 }} />;
 });
 
 type StemCallbacks = {
