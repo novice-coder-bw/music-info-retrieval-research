@@ -189,12 +189,24 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
     s3 = storage.get_s3_client()
     settings = storage.get_r2_settings()
     try:
-        s3.head_object(Bucket=settings['bucket'], Key=req.object_key)
+        object_info = s3.head_object(Bucket=settings['bucket'], Key=req.object_key)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f'Uploaded object not found in R2: {exc}',
         ) from exc
+
+    object_size = object_info.get('ContentLength')
+    object_type = object_info.get('ContentType')
+    if not isinstance(object_size, int) or object_size < 0:
+        s3.delete_object(Bucket=settings['bucket'], Key=req.object_key)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid object size.')
+    if object_size > MAX_UPLOAD_MB * 1024 * 1024:
+        s3.delete_object(Bucket=settings['bucket'], Key=req.object_key)
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f'File size exceeds {MAX_UPLOAD_MB} MB.')
+    if object_type not in ALLOWED_MIME_TYPES:
+        s3.delete_object(Bucket=settings['bucket'], Key=req.object_key)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unsupported object content type.')
 
     artifact_url = storage.get_public_url(req.object_key)
     now_iso = _utcnow_iso()
@@ -202,8 +214,8 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
         'file_id': req.file_id,
         'user_id': user_id,
         'filename': req.filename,
-        'content_type': req.content_type,
-        'size': req.size_bytes,
+        'content_type': object_type,
+        'size': object_size,
         'artifact_url': artifact_url,
         'analysis': {'status': 'pending'},
         'stems': {'status': 'pending'},
@@ -221,9 +233,9 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
         'kind': 'source_audio',
         'storage_backend': 'r2',
         'key': req.object_key,
-        'size': req.size_bytes,
+        'size': object_size,
         'format': Path(req.filename).suffix.lstrip('.') or 'wav',
-        'mime_type': req.content_type,
+        'mime_type': object_type,
     })
 
     # Enqueue analysis task

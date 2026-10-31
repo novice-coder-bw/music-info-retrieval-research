@@ -103,7 +103,7 @@ To migrate historical data from Neon Postgres to Supabase:
    ```bash
    ./scripts/migrate_neon_to_supabase.sh
    ```
-3. The script requires interactive confirmation (`set -euo pipefail`), runs `pg_dump --data-only --no-owner --no-privileges` from `NEON_URL`, and pipes directly to `psql SUPABASE_URL`.
+3. The script requires interactive confirmation, dumps data from the `public` schema excluding `alembic_version`, and loads it with `psql` in a single transaction that stops on SQL errors.
 
 ---
 
@@ -128,7 +128,7 @@ To migrate historical data from Neon Postgres to Supabase:
 ```env
 DOMAIN=api.yourdomain.com
 TAG=latest
-DATABASE_URL=postgresql+psycopg2://postgres.mghlumhhbjfeqvnmqrjs:<PASSWORD>@aws-0-eu-west-3.pooler.supabase.com:5432/postgres
+DATABASE_URL=postgresql+psycopg://postgres.mghlumhhbjfeqvnmqrjs:<PASSWORD>@aws-0-eu-west-3.pooler.supabase.com:5432/postgres
 REDIS_URL=redis://redis:6379/0
 R2_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 R2_BUCKET=music-info-retrieval-research-1

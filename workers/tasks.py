@@ -87,7 +87,8 @@ def build_analysis_result(file_id: str, file_path: str) -> dict:
                 'status': 'completed',
                 'bpm': 120.0,
                 'key': 'C Major',
-                'structure': [{'label': 'verse', 'start': 0.0, 'end': 10.0}],
+                'structure': ['verse'],
+                'duration': 10.0,
                 'analyzed_at': now_iso,
             }
         return {
@@ -113,7 +114,8 @@ def build_analysis_result(file_id: str, file_path: str) -> dict:
             'status': 'completed',
             'bpm': round(float(bpm), 2),
             'key': full_key,
-            'structure': [{'label': 'segment', 'start': 0.0, 'end': round(len(audio) / 44100.0, 2)}],
+            'structure': ['segment'],
+            'duration': round(len(audio) / 44100.0, 2),
             'analyzed_at': now_iso,
         }
     except Exception as exc:
@@ -259,7 +261,7 @@ def separate_stems_with_demucs(file_id: str, file_path: str, temp_dir: Path) -> 
 @app.task(name='workers.tasks.analyze_audio_task')
 def analyze_audio_task(file_id: str, file_path_or_url: str) -> dict:
     """Celery task: analyze audio features and update Postgres."""
-    update_session_stage(file_id, 'analysis', 'processing', 'Extracting audio features...')
+    update_session_stage(file_id, 'analysis', 'active', 'Extracting audio features...')
     # If file_path_or_url is local or needs download
     local_path = file_path_or_url
     temp_download = None
@@ -292,7 +294,7 @@ def analyze_audio_task(file_id: str, file_path_or_url: str) -> dict:
 @app.task(name='workers.tasks.separate_stems_task')
 def separate_stems_task(file_id: str, file_path_or_url: str) -> dict:
     """Celery task: run Demucs separation, upload stems to R2, clean temp scratch files."""
-    update_session_stage(file_id, 'stem_separation', 'processing', 'Separating audio into stems with Demucs...')
+    update_session_stage(file_id, 'stem_separation', 'active', 'Separating audio into stems with Demucs...')
     scratch_base = os.environ.get('SCRATCH_DIR', tempfile.gettempdir())
     work_dir = Path(tempfile.mkdtemp(prefix=f'mirr_demucs_{file_id}_', dir=scratch_base))
 

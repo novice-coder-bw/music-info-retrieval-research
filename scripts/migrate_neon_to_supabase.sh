@@ -29,6 +29,7 @@ if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
 fi
 
 echo ">> Starting data migration..."
-pg_dump --data-only --no-owner --no-privileges "$NEON_URL" | psql "$SUPABASE_URL"
+pg_dump --data-only --no-owner --no-privileges --schema=public --exclude-table=public.alembic_version "$NEON_URL" | \
+    psql --set ON_ERROR_STOP=1 --single-transaction "$SUPABASE_URL"
 
 echo ">> Data migration completed successfully."

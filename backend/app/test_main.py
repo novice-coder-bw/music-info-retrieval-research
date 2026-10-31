@@ -95,7 +95,7 @@ def test_complete_upload_and_session_access():
     object_key = f'uploads/{file_id}/test.wav'
     # Put object in mock S3 first
     s3 = storage_module.get_s3_client()
-    s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'RIFFdemo')
+    s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'RIFFdemo', ContentType='audio/wav')
 
     res = client.post(
         '/api/v1/uploads/complete',
@@ -119,6 +119,43 @@ def test_complete_upload_and_session_access():
     # Test deprecated alias
     legacy_res = client.get(f'/api/session/{file_id}')
     assert legacy_res.status_code == 200
+
+
+@pytest.mark.parametrize(('content_type', 'max_mb', 'expected_status'), [
+    ('audio/wav', 0, 413),
+    ('text/plain', 1, 400),
+])
+def test_complete_upload_rejects_and_deletes_invalid_object(monkeypatch, setup_mock_s3, content_type, max_mb, expected_status):
+    from backend.app import main
+
+    monkeypatch.setattr(main, 'MAX_UPLOAD_MB', max_mb)
+    object_key = 'uploads/test-invalid/source.wav'
+    setup_mock_s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'data', ContentType=content_type)
+    res = client.post('/api/v1/uploads/complete', json={
+        'file_id': 'test-invalid', 'object_key': object_key, 'filename': 'source.wav',
+        'content_type': 'audio/wav', 'size_bytes': 1,
+    })
+    assert res.status_code == expected_status
+    assert setup_mock_s3.list_objects_v2(Bucket=os.environ['R2_BUCKET'], Prefix=object_key).get('KeyCount') == 0
+
+
+def test_complete_upload_uses_stored_metadata(monkeypatch, setup_mock_s3):
+    from backend.app import main
+
+    object_key = 'uploads/test-metadata/source.wav'
+    setup_mock_s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'data', ContentType='audio/wav')
+    sessions, artifacts, tasks = [], [], []
+    monkeypatch.setattr(main.db_store, 'save_session', sessions.append)
+    monkeypatch.setattr(main.db_store, 'save_artifact', artifacts.append)
+    monkeypatch.setattr(main.analyze_audio_task, 'delay', lambda *args: tasks.append(args))
+    res = client.post('/api/v1/uploads/complete', json={
+        'file_id': 'test-metadata', 'object_key': object_key, 'filename': 'source.wav',
+        'content_type': 'audio/mpeg', 'size_bytes': 1,
+    })
+    assert res.status_code == 200
+    assert sessions[0]['size'] == artifacts[0]['size'] == 4
+    assert sessions[0]['content_type'] == artifacts[0]['mime_type'] == 'audio/wav'
+    assert len(tasks) == 1
 
 
 def test_session_ownership_enforcement():

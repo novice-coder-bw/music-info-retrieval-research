@@ -41,16 +41,17 @@ docker compose -f docker-compose.dev.yml up -d
 
 # 2. Configure .env from .env.example
 cp .env.example .env
-# Edit DATABASE_URL to point to postgresql+psycopg2://postgres:postgres@localhost:5432/postgres
+# Edit DATABASE_URL to point to postgresql+psycopg://postgres:postgrespassword@localhost:5432/postgres
+# Set REDIS_URL=redis://localhost:6379/0 and configure the R2 settings.
 
 # 3. Apply database migrations
-alembic upgrade head
+python -m dotenv run -- alembic upgrade head
 
 # 4. Run the API server
-uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+python -m dotenv run -- uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
 
 # 5. Run Celery worker
-celery -A workers.tasks worker --loglevel=info -c 1
+python -m dotenv run -- celery -A workers.tasks worker --loglevel=info -c 1
 ```
 
 ## Running Tests

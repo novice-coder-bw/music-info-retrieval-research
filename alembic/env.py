@@ -19,7 +19,7 @@ if str(ROOT_DIR) not in sys.path:
 try:
     from dotenv import load_dotenv
     load_dotenv(ROOT_DIR / '.env')
-except Exception:
+except ImportError:
     pass
 
 from db.engine import normalize_database_url  # noqa: E402
