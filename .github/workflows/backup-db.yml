@@ -1,0 +1,92 @@
+# Secrets needed:
+# - DATABASE_URL: Supabase session pooler connection string (port 5432)
+# - BACKUP_PASSPHRASE: Encryption passphrase for AES-256-CBC
+# - R2_ENDPOINT: Cloudflare R2 endpoint URL
+# - R2_BUCKET: Cloudflare R2 bucket name
+# - R2_ACCESS_KEY_ID: Cloudflare R2 access key
+# - R2_SECRET_ACCESS_KEY: Cloudflare R2 secret key
+# - TELEGRAM_BOT_TOKEN: (Optional) Telegram bot token for failure alerts
+# - TELEGRAM_CHAT_ID: (Optional) Telegram chat ID for failure alerts
+
+name: backup-db
+
+on:
+  schedule:
+    # Weekly on Sunday at 02:00 UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+    steps:
+      - name: Install PostgreSQL 17 client and AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates gnupg unzip
+          sudo install -d /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/keyrings/postgresql.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+
+      - name: Dump, encrypt and upload database backup
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y%m%d_%H%M%SZ)
+          BACKUP_FILE="mirr_supabase_backup_${DATE}.sql.gz.enc"
+
+          echo ">> Running pg_dump..."
+          pg_dump "$DATABASE_URL" \
+            --clean --if-exists --no-owner --no-privileges \
+            | gzip \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -pass pass:"$BACKUP_PASSPHRASE" \
+            > "$BACKUP_FILE"
+
+          echo ">> Uploading encrypted backup to R2..."
+          aws s3 cp "$BACKUP_FILE" "s3://${R2_BUCKET}/backups/${BACKUP_FILE}" \
+            --endpoint-url "$R2_ENDPOINT"
+
+          echo ">> Pruning backups older than 8 weeks (56 days)..."
+          CUTOFF=$(date -u -d "56 days ago" +%Y%m%d_%H%M%SZ)
+          aws s3 ls "s3://${R2_BUCKET}/backups/" --endpoint-url "$R2_ENDPOINT" | while read -r line; do
+            FILE=$(echo "$line" | awk '{print $4}')
+            if [ -n "$FILE" ]; then
+              # Extract date from filename mirr_supabase_backup_YYYYMMDD_HHMMSSZ.sql.gz.enc
+              FILEDATE=$(echo "$FILE" | sed -n 's/mirr_supabase_backup_\([0-9]*_[0-9]*Z\)\.sql\.gz\.enc/\1/p')
+              if [ -n "$FILEDATE" ] && [ "$FILEDATE" \< "$CUTOFF" ]; then
+                echo "Deleting old backup: $FILE"
+                aws s3 rm "s3://${R2_BUCKET}/backups/$FILE" --endpoint-url "$R2_ENDPOINT"
+              fi
+            fi
+          done
+
+          rm -f "$BACKUP_FILE"
+          echo ">> Backup completed successfully."
+
+      - name: Notify on failure (Telegram)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d text="🚨 backup-db workflow failed to back up Supabase PostgreSQL!" || true
+          fi

@@ -1,14 +1,4 @@
-"""Store adapter for the durable session store (AD-2).
-
-Mirrors the existing in-memory ``SESSIONS`` dict contract in
-``backend/app/main.py``: ``get_session``/``save_session`` by ``file_id`` and
-``list_artifacts`` per session. Callers that need to simulate a process restart
-can pass an explicit ``session_factory`` (e.g. a fresh engine bound to the same
-database file).
-"""
-
 from typing import Optional
-
 from sqlalchemy.orm import sessionmaker
 
 from db.engine import get_session_factory
@@ -16,6 +6,7 @@ from db.models import ArtifactRecord, SessionRecord, utc_now_iso
 
 _SESSION_COLUMNS = (
     'file_id',
+    'user_id',
     'filename',
     'content_type',
     'size',
@@ -41,7 +32,7 @@ def save_session(session_data: dict, session_factory: Optional[sessionmaker] = N
             db.add(SessionRecord(**values))
         else:
             for column, value in values.items():
-                if column != 'file_id':
+                if column != 'file_id' and value is not None:
                     setattr(row, column, value)
         db.commit()
 
@@ -53,20 +44,17 @@ def get_session(file_id: str, session_factory: Optional[sessionmaker] = None) ->
         row = db.get(SessionRecord, file_id)
         if row is None:
             return None
-        return {column: getattr(row, column) for column in _SESSION_COLUMNS}
+        data = {column: getattr(row, column) for column in _SESSION_COLUMNS}
+        data['updated_at'] = row.updated_at
+        return data
 
 
 def save_artifact(artifact: dict, session_factory: Optional[sessionmaker] = None) -> None:
-    """Upsert an artifact row keyed by ``(file_id, name, kind)``.
-
-    Idempotent: re-registering the same artifact (e.g. a retried separation that
-    previously left a ``failed``/``active`` stems state) updates the existing row
-    instead of inserting a duplicate, so the store never lies about how many
-    artifacts a session produced.
-    """
+    """Upsert an artifact row keyed by ``(file_id, name, kind)``."""
     factory = session_factory or get_session_factory()
     allowed = {column.name for column in ArtifactRecord.__table__.columns}
     values = {k: v for k, v in artifact.items() if k in allowed and k != 'id'}
+    values.setdefault('storage_backend', 'r2')
     with factory() as db:
         row = (
             db.query(ArtifactRecord)
@@ -81,7 +69,7 @@ def save_artifact(artifact: dict, session_factory: Optional[sessionmaker] = None
             db.add(ArtifactRecord(**values))
         else:
             for column, value in values.items():
-                if column != 'file_id':
+                if column != 'id':
                     setattr(row, column, value)
         db.commit()
 
