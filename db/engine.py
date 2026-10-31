@@ -32,11 +32,23 @@ def get_database_url() -> str:
 
 def create_engine_for_url(url: str) -> Engine:
     """Create an engine with Supabase pool and timeout settings."""
+    from urllib.parse import parse_qs, urlparse
+
     normalized = normalize_database_url(url)
+    parsed = urlparse(normalized)
+    query_params = parse_qs(parsed.query)
+
     connect_args = {
-        'sslmode': 'require',
         'connect_timeout': 10,
     }
+    # Default sslmode to 'require' for remote hosts, but allow 'prefer'/'disable' or local test services
+    if 'sslmode' in query_params:
+        connect_args['sslmode'] = query_params['sslmode'][0]
+    elif parsed.hostname in ('localhost', '127.0.0.1', 'postgres'):
+        connect_args['sslmode'] = 'prefer'
+    else:
+        connect_args['sslmode'] = 'require'
+
     # Note: create_engine is lazy and does not establish a connection at import time
     return create_engine(
         normalized,
