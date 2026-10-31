@@ -15,8 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU PyTorch first for layer caching
-RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Install CPU PyTorch and compatible torchaudio/torchcodec for layer caching
+RUN pip install --no-cache-dir torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cpu || \
+    pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements-worker.txt .
 RUN pip install --no-cache-dir -r requirements-worker.txt

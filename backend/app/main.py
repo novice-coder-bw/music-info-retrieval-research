@@ -171,6 +171,16 @@ def presign_upload(req: PresignUploadRequest, user_id: str = Depends(get_current
         expires_in=3600,
     )
 
+    # Record upload intent bound to caller
+    db_store.save_upload_intent({
+        'object_key': object_key,
+        'file_id': file_id,
+        'user_id': user_id,
+        'expected_content_type': req.content_type,
+        'expected_max_size': max_bytes,
+        'completed': False,
+    })
+
     return PresignUploadResponse(
         file_id=file_id,
         object_key=object_key,
@@ -185,6 +195,25 @@ def presign_upload(req: PresignUploadRequest, user_id: str = Depends(get_current
 )
 def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_current_user_id)):
     """Complete direct upload: verify R2 object, create session, enqueue analysis."""
+    # Verify ownership and valid intent
+    intent = db_store.get_upload_intent(req.object_key)
+    if intent:
+        if intent['user_id'] != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail='Caller does not own this upload intent.',
+            )
+        if intent.get('completed'):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='Upload intent has already been completed.',
+            )
+        if intent['file_id'] != req.file_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='file_id mismatch with presigned intent.',
+            )
+
     # Verify object exists in R2
     s3 = storage.get_s3_client()
     settings = storage.get_r2_settings()
@@ -238,8 +267,11 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
         'mime_type': object_type,
     })
 
-    # Enqueue analysis task
-    analyze_audio_task.delay(req.file_id, artifact_url)
+    if intent:
+        db_store.mark_upload_intent_completed(req.object_key)
+
+    # Enqueue analysis task passing the object_key directly
+    analyze_audio_task.delay(req.file_id, req.object_key)
 
     return {'file_id': req.file_id, 'status': 'enqueued', 'artifact_url': artifact_url}
 

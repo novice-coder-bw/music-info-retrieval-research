@@ -102,9 +102,14 @@ jobs:
         run: |
           scp -r deploy/* "deploy@$DROPLET_HOST:/opt/mir/"
 
-      - name: Run release script on Droplet
+      - name: Validate tag and run release script on Droplet
         run: |
-          ssh "deploy@$DROPLET_HOST" "bash /opt/mir/release.sh $DEPLOY_TAG"
+          set -euo pipefail
+          if [[ ! "$DEPLOY_TAG" =~ ^[0-9a-zA-Z._-]{1,64}$ ]]; then
+            echo "::error::Invalid tag format: $DEPLOY_TAG"
+            exit 1
+          fi
+          ssh "deploy@$DROPLET_HOST" "bash /opt/mir/release.sh \"$DEPLOY_TAG\""
 
       - name: Notify on failure (Telegram)
         if: failure()

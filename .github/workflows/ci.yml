@@ -39,7 +39,7 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: postgresql+psycopg://mirr:mirrpassword@localhost:5432/mirr
+      DATABASE_URL: postgresql+psycopg://mirr:mirrpassword@localhost:5432/mirr?sslmode=disable
       REDIS_URL: redis://localhost:6379/0
       CELERY_EAGER: "1"
       ALLOW_PLACEHOLDER_STEMS: "1"

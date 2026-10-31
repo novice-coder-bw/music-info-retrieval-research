@@ -259,16 +259,17 @@ def separate_stems_with_demucs(file_id: str, file_path: str, temp_dir: Path) -> 
 
 
 @app.task(name='workers.tasks.analyze_audio_task')
-def analyze_audio_task(file_id: str, file_path_or_url: str) -> dict:
+def analyze_audio_task(file_id: str, file_path_or_key: str) -> dict:
     """Celery task: analyze audio features and update Postgres."""
     update_session_stage(file_id, 'analysis', 'active', 'Extracting audio features...')
-    # If file_path_or_url is local or needs download
-    local_path = file_path_or_url
+    local_path = file_path_or_key
     temp_download = None
-    if file_path_or_url.startswith('http://') or file_path_or_url.startswith('https://'):
-        parsed = urlparse(file_path_or_url)
-        object_key = parsed.path.lstrip('/')
-        # Download from R2 to temp file
+    # Download from R2 if not an existing local file
+    if not os.path.exists(file_path_or_key):
+        object_key = file_path_or_key
+        if file_path_or_key.startswith(('http://', 'https://')):
+            parsed = urlparse(file_path_or_key)
+            object_key = parsed.path.lstrip('/')
         temp_download = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         temp_download.close()
         s3 = storage.get_s3_client()
@@ -292,17 +293,18 @@ def analyze_audio_task(file_id: str, file_path_or_url: str) -> dict:
 
 
 @app.task(name='workers.tasks.separate_stems_task')
-def separate_stems_task(file_id: str, file_path_or_url: str) -> dict:
+def separate_stems_task(file_id: str, file_path_or_key: str) -> dict:
     """Celery task: run Demucs separation, upload stems to R2, clean temp scratch files."""
     update_session_stage(file_id, 'stem_separation', 'active', 'Separating audio into stems with Demucs...')
     scratch_base = os.environ.get('SCRATCH_DIR', tempfile.gettempdir())
     work_dir = Path(tempfile.mkdtemp(prefix=f'mirr_demucs_{file_id}_', dir=scratch_base))
 
-    local_path = file_path_or_url
-    temp_download = None
-    if file_path_or_url.startswith('http://') or file_path_or_url.startswith('https://'):
-        parsed = urlparse(file_path_or_url)
-        object_key = parsed.path.lstrip('/')
+    local_path = file_path_or_key
+    if not os.path.exists(file_path_or_key):
+        object_key = file_path_or_key
+        if file_path_or_key.startswith(('http://', 'https://')):
+            parsed = urlparse(file_path_or_key)
+            object_key = parsed.path.lstrip('/')
         temp_download = work_dir / 'source_audio.wav'
         s3 = storage.get_s3_client()
         settings = storage.get_r2_settings()

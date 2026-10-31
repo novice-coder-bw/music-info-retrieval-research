@@ -4,6 +4,11 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+if [ -f .env ]; then
+    # shellcheck disable=SC1091
+    set -a && source .env && set +a
+fi
+
 PY=python3
 
 echo "==> Starting API..."

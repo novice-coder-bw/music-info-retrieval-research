@@ -7,13 +7,15 @@ _engine: Optional[Engine] = None
 
 
 def normalize_database_url(url: str) -> str:
-    """Normalize Postgres URLs to use psycopg (v3) or preserve psycopg2 if explicitly given."""
+    """Normalize Postgres URLs to use psycopg (v3)."""
     if not url:
         return ''
     if url.startswith('sqlite'):
         raise RuntimeError('SQLite is not supported. Use Supabase PostgreSQL with DATABASE_URL.')
-    # If starting with postgres:// or bare postgresql://, translate to postgresql+psycopg://
+    # If starting with postgres:// or bare postgresql:// or postgresql+psycopg2://, translate to postgresql+psycopg://
     if url.startswith('postgres://'):
+        return 'postgresql+psycopg://' + url.split('://', 1)[1]
+    if url.startswith('postgresql+psycopg2://'):
         return 'postgresql+psycopg://' + url.split('://', 1)[1]
     if url.startswith('postgresql://'):
         return 'postgresql+psycopg://' + url.split('://', 1)[1]
@@ -44,8 +46,8 @@ def create_engine_for_url(url: str) -> Engine:
     # Default sslmode to 'require' for remote hosts, but allow 'prefer'/'disable' or local test services
     if 'sslmode' in query_params:
         connect_args['sslmode'] = query_params['sslmode'][0]
-    elif parsed.hostname in ('localhost', '127.0.0.1', 'postgres'):
-        connect_args['sslmode'] = 'prefer'
+    elif parsed.hostname in ('localhost', '127.0.0.1', '::1', 'postgres', 'db'):
+        connect_args['sslmode'] = 'disable'
     else:
         connect_args['sslmode'] = 'require'
 

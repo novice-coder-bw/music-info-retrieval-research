@@ -2,7 +2,7 @@ from typing import Optional
 from sqlalchemy.orm import sessionmaker
 
 from db.engine import get_session_factory
-from db.models import ArtifactRecord, SessionRecord, utc_now_iso
+from db.models import ArtifactRecord, SessionRecord, UploadIntentRecord, utc_now_iso
 
 _SESSION_COLUMNS = (
     'file_id',
@@ -72,6 +72,53 @@ def save_artifact(artifact: dict, session_factory: Optional[sessionmaker] = None
                 if column != 'id':
                     setattr(row, column, value)
         db.commit()
+
+
+def save_upload_intent(intent: dict, session_factory: Optional[sessionmaker] = None) -> None:
+    """Save a presigned upload intent."""
+    factory = session_factory or get_session_factory()
+    with factory() as db:
+        record = UploadIntentRecord(
+            object_key=intent['object_key'],
+            file_id=intent['file_id'],
+            user_id=intent['user_id'],
+            expected_content_type=intent['expected_content_type'],
+            expected_max_size=intent['expected_max_size'],
+            completed=intent.get('completed', False),
+            created_at=utc_now_iso(),
+        )
+        db.merge(record)
+        db.commit()
+
+
+def get_upload_intent(object_key: str, session_factory: Optional[sessionmaker] = None) -> Optional[dict]:
+    """Retrieve an upload intent by object key."""
+    factory = session_factory or get_session_factory()
+    with factory() as db:
+        row = db.get(UploadIntentRecord, object_key)
+        if not row:
+            return None
+        return {
+            'object_key': row.object_key,
+            'file_id': row.file_id,
+            'user_id': row.user_id,
+            'expected_content_type': row.expected_content_type,
+            'expected_max_size': row.expected_max_size,
+            'completed': row.completed,
+            'created_at': row.created_at,
+        }
+
+
+def mark_upload_intent_completed(object_key: str, session_factory: Optional[sessionmaker] = None) -> bool:
+    """Mark an upload intent as completed atomically; returns False if not found or already completed."""
+    factory = session_factory or get_session_factory()
+    with factory() as db:
+        row = db.get(UploadIntentRecord, object_key)
+        if not row or row.completed:
+            return False
+        row.completed = True
+        db.commit()
+        return True
 
 
 def list_artifacts(file_id: str, session_factory: Optional[sessionmaker] = None) -> list[dict]:

@@ -5,6 +5,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+if [ -f .env ]; then
+    # shellcheck disable=SC1091
+    set -a && source .env && set +a
+fi
+
 echo "==> Music Analysis Platform Local Setup"
 
 # 1. Check Python

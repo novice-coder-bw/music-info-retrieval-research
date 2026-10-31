@@ -5,9 +5,9 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgrespassword
-      POSTGRES_DB: postgres
+      POSTGRES_USER: mirr
+      POSTGRES_PASSWORD: mirrpassword
+      POSTGRES_DB: mirr
     volumes:
       - pg_data:/var/lib/postgresql/data
 

@@ -128,7 +128,7 @@ To migrate historical data from Neon Postgres to Supabase:
 ```env
 DOMAIN=api.yourdomain.com
 TAG=latest
-DATABASE_URL=postgresql+psycopg2://postgres.mghlumhhbjfeqvnmqrjs:<PASSWORD>@aws-0-eu-west-3.pooler.supabase.com:5432/postgres
+DATABASE_URL=postgresql+psycopg://postgres.mghlumhhbjfeqvnmqrjs:<PASSWORD>@aws-0-eu-west-3.pooler.supabase.com:5432/postgres
 REDIS_URL=redis://redis:6379/0
 R2_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 R2_BUCKET=music-info-retrieval-research-1

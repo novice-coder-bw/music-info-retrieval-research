@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from moto import mock_aws
 
 # Configure test environment
-os.environ.setdefault('DATABASE_URL', 'postgresql+psycopg://mirr:mirr@localhost:5432/mirr')
+os.environ.setdefault('DATABASE_URL', 'postgresql+psycopg://mirr:mirrpassword@localhost:5432/mirr?sslmode=disable')
 os.environ['R2_ENDPOINT'] = 'mock://r2'
 os.environ['R2_BUCKET'] = 'music-info-retrieval-research-1'
 os.environ['R2_ACCESS_KEY_ID'] = 'fake-access-key'
@@ -188,3 +188,52 @@ def test_multipart_upload_and_separation_flow():
     assert sess['stems'] is not None
     assert sess['stems']['status'] == 'completed'
     assert len(sess['stems']['stems']) == 4
+
+def test_complete_upload_security_ownership_and_replay(setup_mock_s3):
+    # Presign an upload for user A
+    presign_res = client.post(
+        '/api/v1/uploads/presign',
+        json={'filename': 'song.wav', 'content_type': 'audio/wav', 'size_bytes': 1024},
+    )
+    assert presign_res.status_code == 200
+    pdata = presign_res.json()
+    file_id = pdata['file_id']
+    object_key = pdata['object_key']
+
+    setup_mock_s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'data1234', ContentType='audio/wav')
+
+    # Try completing as another user
+    app.dependency_overrides[get_current_user_id] = lambda: 'other-hacker'
+    res_hijack = client.post(
+        '/api/v1/uploads/complete',
+        json={'file_id': file_id, 'object_key': object_key, 'filename': 'song.wav', 'content_type': 'audio/wav', 'size_bytes': 8},
+    )
+    assert res_hijack.status_code == 403
+
+    # Complete as owner
+    app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
+    res_ok = client.post(
+        '/api/v1/uploads/complete',
+        json={'file_id': file_id, 'object_key': object_key, 'filename': 'song.wav', 'content_type': 'audio/wav', 'size_bytes': 8},
+    )
+    assert res_ok.status_code == 200
+
+    # Try replay complete
+    res_replay = client.post(
+        '/api/v1/uploads/complete',
+        json={'file_id': file_id, 'object_key': object_key, 'filename': 'song.wav', 'content_type': 'audio/wav', 'size_bytes': 8},
+    )
+    assert res_replay.status_code == 409
+
+
+def test_ssl_default_local_vs_remote():
+    from db.engine import create_engine_for_url
+    import inspect
+
+    e_local = create_engine_for_url('postgresql+psycopg://u:p@localhost:5432/db')
+    cparams_local = inspect.getclosurevars(e_local.pool._creator).nonlocals['cparams']
+    assert cparams_local['sslmode'] == 'disable'
+
+    e_remote = create_engine_for_url('postgresql+psycopg://u:p@aws-0-eu-west-3.pooler.supabase.com:5432/postgres')
+    cparams_remote = inspect.getclosurevars(e_remote.pool._creator).nonlocals['cparams']
+    assert cparams_remote['sslmode'] == 'require'

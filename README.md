@@ -41,7 +41,7 @@ docker compose -f docker-compose.dev.yml up -d
 
 # 2. Configure .env from .env.example
 cp .env.example .env
-# Edit DATABASE_URL to point to postgresql+psycopg2://postgres:postgres@localhost:5432/postgres
+# Edit DATABASE_URL to point to postgresql+psycopg://mirr:mirrpassword@localhost:5432/mirr?sslmode=disable
 
 # 3. Apply database migrations
 alembic upgrade head

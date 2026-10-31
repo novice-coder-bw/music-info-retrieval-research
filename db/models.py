@@ -30,6 +30,19 @@ class SessionRecord(Base):
     updated_at: Mapped[str] = mapped_column(String(64), default=utc_now_iso, onupdate=utc_now_iso)
 
 
+class UploadIntentRecord(Base):
+    """Database model for tracking presigned upload issuance and ownership."""
+    __tablename__ = 'upload_intents'
+
+    object_key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    file_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    expected_content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    expected_max_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[str] = mapped_column(String(64), default=utc_now_iso)
+
+
 class ArtifactRecord(Base):
     """Database model for stored audio and stem artifacts."""
     __tablename__ = 'artifacts'

@@ -35,6 +35,8 @@ def test_task_starts_with_active_stage(monkeypatch, tmp_path, task_name, stage):
     monkeypatch.setattr(tasks, 'build_analysis_result', lambda *args: {'status': 'completed'})
     monkeypatch.setattr(tasks, 'separate_stems_with_demucs', lambda *args: {'status': 'completed', 'stems': []})
     monkeypatch.setenv('SCRATCH_DIR', str(tmp_path))
-    getattr(tasks, task_name).run('file', 'source.wav')
+    source_file = tmp_path / 'source.wav'
+    source_file.write_bytes(b'dummy')
+    getattr(tasks, task_name).run('file', str(source_file))
     assert stages[0].stage == stage
     assert stages[0].status == 'active'
