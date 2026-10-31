@@ -6,8 +6,8 @@ Can run offline without connecting to PostgreSQL or R2.
 
 import json
 import os
-import sys
 from pathlib import Path
+import sys
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -22,7 +22,7 @@ os.environ.setdefault('R2_SECRET_ACCESS_KEY', 'dummy_secret')
 os.environ.setdefault('REDIS_URL', 'redis://localhost:6379/0')
 os.environ.setdefault('SUPABASE_JWKS_URL', 'https://mghlumhhbjfeqvnmqrjs.supabase.co/auth/v1/.well-known/jwks.json')
 
-from backend.app.main import app
+from backend.app.main import app  # noqa: E402
 
 
 def main():

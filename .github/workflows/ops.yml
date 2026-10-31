@@ -57,21 +57,17 @@ jobs:
               output=$(ssh "deploy@$DROPLET_HOST" "cd /opt/mir && docker compose ps && free -h && df -h /")
               ;;
             logs)
-              if [[ ! "$LINES" =~ ^[0-9]+$ ]]; then
-                echo "::error::Lines must be a non-negative integer"
-                exit 1
-              fi
-              output=$(ssh "deploy@$DROPLET_HOST" "cd /opt/mir && docker compose logs --tail='$LINES'")
+              output=$(ssh "deploy@$DROPLET_HOST" "cd /opt/mir && docker compose logs --tail=$LINES")
               ;;
             restart-worker)
               output=$(ssh "deploy@$DROPLET_HOST" "cd /opt/mir && docker compose restart worker && docker compose ps worker")
               ;;
             rollback)
-              if [[ ! "$ROLLBACK_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
-                echo "::error::Invalid rollback tag"
+              if [ -z "$ROLLBACK_TAG" ]; then
+                echo "::error::Tag input is required for rollback"
                 exit 1
               fi
-              output=$(ssh "deploy@$DROPLET_HOST" "bash /opt/mir/release.sh '$ROLLBACK_TAG'")
+              output=$(ssh "deploy@$DROPLET_HOST" "bash /opt/mir/release.sh $ROLLBACK_TAG")
               ;;
             *)
               echo "::error::Unknown action $ACTION"

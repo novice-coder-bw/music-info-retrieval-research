@@ -91,13 +91,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate deploy tag
-        run: |
-          if [[ ! "$DEPLOY_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
-            echo "::error::Invalid deploy tag"
-            exit 1
-          fi
-
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -111,7 +104,7 @@ jobs:
 
       - name: Run release script on Droplet
         run: |
-          ssh "deploy@$DROPLET_HOST" "bash /opt/mir/release.sh '$DEPLOY_TAG'"
+          ssh "deploy@$DROPLET_HOST" "bash /opt/mir/release.sh $DEPLOY_TAG"
 
       - name: Notify on failure (Telegram)
         if: failure()
