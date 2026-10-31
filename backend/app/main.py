@@ -1,774 +1,447 @@
 from datetime import datetime, timezone
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+import logging
+import os
 from pathlib import Path
 import sys
 import uuid
-import logging
+
+from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-logger = logging.getLogger(__name__)
-
-from shared.schemas import (
+from backend.app.auth import get_current_user_id  # noqa: E402
+from db.engine import get_engine  # noqa: E402
+from db import store as db_store  # noqa: E402
+from services import storage  # noqa: E402
+from shared.schemas import (  # noqa: E402
+    AnalysisMetadata,
     AnalyzeErrorResponse,
     AnalyzeRequest,
     AnalyzeResponse,
-    AnalysisMetadata,
     SeparateErrorResponse,
     SeparateRequest,
     SeparateResponse,
-    StemArtifact,
     StemsMetadata,
-    UploadResponse,
     UploadErrorResponse,
+    UploadResponse,
     WorkflowStageStatus,
 )
-from workers.tasks import (
-    analyze_audio as run_worker_analysis,
-    analyze_audio_task,
-    broker_reachable,
-    separate_stems as run_worker_separation,
-    separate_stems_task,
+from workers.tasks import analyze_audio_task, app as celery_app, separate_stems_task  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title='Music Analysis Platform API',
+    description='API for stem separation and audio feature analysis',
+    version='1.0.0',
 )
 
-# --- Story 2.3: durable persistence (AD-2) ----------------------------------
-# Optional integration: when SQLAlchemy/boto3 (or the db/services packages)
-# are not importable, the app boots and behaves exactly as before using the
-# in-memory SESSIONS dict + local uploads. Mirror of the Celery/Demucs pattern.
-try:
-    from db.engine import get_session_factory as _db_get_session_factory
-    from db import store as _db_store
-    from services import storage as _storage
+# CORS setup
+cors_origin_regex = os.environ.get(
+    'CORS_ORIGIN_REGEX',
+    r'^https:\/\/(.*\.)?(lovable\.app|lovableproject\.com|pages\.dev)(:[0-9]+)?$',
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=cors_origin_regex,
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
 
-    STORE_AVAILABLE = True
-except Exception:  # pragma: no cover - optional-dependency degraded mode
-    _db_get_session_factory = None
-    _db_store = None
-    _storage = None
-    STORE_AVAILABLE = False
-
-app = FastAPI()
-UPLOAD_DIR = Path(__file__).resolve().parent.parent / 'uploads'
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-STEM_DIR = UPLOAD_DIR / 'stems'
-STEM_DIR.mkdir(parents=True, exist_ok=True)
-
-app.mount('/uploads', StaticFiles(directory=UPLOAD_DIR), name='uploads')
-
-SESSIONS: dict[str, dict] = {}
+MAX_UPLOAD_MB = int(os.environ.get('MAX_UPLOAD_MB', '100'))
+ALLOWED_MIME_TYPES = {'audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3'}
 
 
-def _session_factory():
-    """Return the SQLAlchemy session factory when the store is available."""
-    if not STORE_AVAILABLE:
-        raise RuntimeError('Persistence store is not available.')
-    return _db_get_session_factory()
+class PresignUploadRequest(BaseModel):
+    filename: str
+    content_type: str = Field(..., description='audio/wav or audio/mpeg')
+    size_bytes: int = Field(..., description='Size of audio in bytes')
 
 
-def _store_session(session: dict) -> None:
-    """Best-effort durable persistence; never raise into request handlers."""
-    if STORE_AVAILABLE:
-        try:
-            _db_store.save_session(session, session_factory=_session_factory())
-        except Exception as exc:  # pragma: no cover - best-effort durability
-            logger.warning('Failed to persist session %s: %s', session.get('file_id'), exc)
+class PresignUploadResponse(BaseModel):
+    file_id: str
+    object_key: str
+    upload_url: str
+    expires_in: int
 
 
-def _store_artifact(artifact: dict) -> None:
-    """Best-effort artifact registration; never raise into request handlers."""
-    if STORE_AVAILABLE:
-        try:
-            _db_store.save_artifact(artifact, session_factory=_session_factory())
-        except Exception as exc:  # pragma: no cover - best-effort durability
-            logger.warning('Failed to persist artifact %s: %s', artifact.get('name'), exc)
+class CompleteUploadRequest(BaseModel):
+    file_id: str
+    object_key: str
+    filename: str
+    content_type: str
+    size_bytes: int
 
 
-def _resolve_session(file_id: str) -> dict | None:
-    """Resolve a session from the in-memory dict first, then the durable store.
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    ``SESSIONS`` is the authoritative cache within a process: every mutation
-    writes to it directly, so an entry present here is at least as fresh as the
-    store (a store write may have failed and been logged as a WARNING). The store
-    is consulted only on a cache miss — exactly the process-restart path, where
-    the store is the only surviving source of truth — and the result is seeded
-    back into ``SESSIONS`` so every existing helper and test that reads
-    ``main.SESSIONS`` directly keeps working unchanged.
+
+# --- Health Check ---
+@app.get('/health', tags=['Monitoring'])
+def health(response: Response):
+    """Health check for Postgres, Redis, R2, and Celery worker.
+
+    Returns HTTP 200 if all services pass, or HTTP 503 if any service fails.
     """
-    cached = SESSIONS.get(file_id)
-    if cached is not None:
-        return cached
-    if STORE_AVAILABLE:
-        try:
-            stored = _db_store.get_session(file_id, session_factory=_session_factory())
-            if stored is not None:
-                SESSIONS[file_id] = stored
-                return stored
-        except Exception as exc:  # pragma: no cover - store availability guard
-            logger.warning('Failed to resolve session %s from store: %s', file_id, exc)
-    return SESSIONS.get(file_id)
+    checks = {
+        'database': False,
+        'redis': False,
+        'storage': False,
+        'worker': False,
+    }
 
-
-def _mirror_file(
-    local_path: Path,
-    object_key: str,
-    content_type: str | None,
-    local_url: str,
-) -> dict:
-    """Mirror a local file into the active object-storage backend (best-effort)."""
-    if STORE_AVAILABLE and _storage is not None:
-        try:
-            return _storage.mirror_file(
-                local_path=local_path,
-                object_key=object_key,
-                content_type=content_type,
-                local_url=local_url,
-            )
-        except Exception as exc:  # pragma: no cover - storage availability guard
-            logger.warning('Object-storage mirror failed for %s, falling back to local: %s', object_key, exc)
-    return {'url': local_url, 'storage_backend': 'local', 'key': None}
-
-ACCEPTED_TYPES = {'audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3'}
-ACCEPTED_EXTENSIONS = {'.wav', '.mp3'}
-
-
-def get_file_extension(filename: str) -> str:
-    return Path(filename).suffix.lower()
-
-
-def is_content_type_extension_compatible(content_type: str, extension: str) -> bool:
-    return (
-        extension == '.wav' and content_type in {'audio/wav', 'audio/x-wav'}
-    ) or (
-        extension == '.mp3' and content_type in {'audio/mpeg', 'audio/mp3'}
-    )
-
-
-async def validate_audio_header(file: UploadFile, extension: str) -> None:
-    header = await file.read(1024)
-    await file.seek(0)
-
-    if extension == '.wav':
-        if len(header) < 12 or header[:4] != b'RIFF' or header[8:12] != b'WAVE':
-            raise ValueError('WAV header is invalid or the file is corrupt.')
-    elif extension == '.mp3':
-        if not (
-            header.startswith(b'ID3')
-            or (len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xF0) == 0xF0)
-        ):
-            raise ValueError('MP3 header is invalid or the file is corrupt.')
-    else:
-        raise ValueError('Unsupported audio extension.')
-
-
-def error_response(
-    error_code: str,
-    message: str,
-    detail: str | None = None,
-    stage: str | None = None,
-    next_action: str | None = None,
-    workflow_stages: list[WorkflowStageStatus] | None = None,
-    status_code: int = 400,
-) -> JSONResponse:
-    response = UploadErrorResponse(
-        error_code=error_code,
-        message=message,
-        detail=detail,
-        stage=stage,
-        next_action=next_action,
-        workflow_stages=workflow_stages,
-    )
-    return JSONResponse(status_code=status_code, content=response.model_dump())
-
-
-def build_workflow_stages(analysis_status: str, analysis_message: str) -> list[WorkflowStageStatus]:
-    return [
-        WorkflowStageStatus(
-            stage='upload',
-            status='completed',
-            message='Upload completed successfully.',
-        ),
-        WorkflowStageStatus(
-            stage='analysis',
-            status=analysis_status,  # type: ignore[arg-type]
-            message=analysis_message,
-        ),
-    ]
-
-
-def build_analyze_response(file_id: str, analysis: AnalysisMetadata) -> dict:
-    workflow_status = analysis.status if analysis.status in {'active', 'failed'} else 'completed'
-    workflow_message = analysis.message or 'Analysis completed successfully.'
-    if analysis.status == 'failed':
-        workflow_message = analysis.message or 'Analysis failed.'
-
-    return AnalyzeResponse(
-        file_id=file_id,
-        analysis=analysis,
-        workflow_stages=build_workflow_stages(workflow_status, workflow_message),
-    ).model_dump()
-
-
-def run_analysis_task(file_id: str, file_path: str) -> dict:
-    """Execute analysis via Celery when available, otherwise run in-process.
-
-    Celery dispatch is gated on the broker being reachable so a downed/absent
-    Redis falls back to in-process execution immediately rather than blocking
-    in kombu's reconnect loop.
-    """
-    if analyze_audio_task is not None and broker_reachable():
-        try:
-            async_result = analyze_audio_task.delay(file_id, file_path)
-            return async_result.get(timeout=30)
-        except Exception:
-            pass
-    return run_worker_analysis(file_id, file_path)
-
-
-def mime_for_extension(ext: str | None) -> str:
-    ext = (ext or '').lower()
-    if ext == 'wav':
-        return 'audio/wav'
-    if ext == 'mp3':
-        return 'audio/mpeg'
-    return 'audio/octet-stream'
-
-
-def build_stage_dicts(
-    analysis_status: str,
-    analysis_message: str,
-    separation_status: str | None = None,
-    separation_message: str | None = None,
-    separation_next_action: str | None = None,
-) -> list[dict]:
-    """Build the serialized workflow stage list for a session or response."""
-    stages: list[dict] = [
-        {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
-        {'stage': 'analysis', 'status': analysis_status, 'message': analysis_message},
-    ]
-    if separation_status is not None:
-        stage: dict = {
-            'stage': 'stem_separation',
-            'status': separation_status,
-            'message': separation_message,
-        }
-        if separation_next_action:
-            stage['next_action'] = separation_next_action
-        stages.append(stage)
-    return stages
-
-
-def workflow_stage_models(stages: list[dict]) -> list[WorkflowStageStatus]:
-    return [WorkflowStageStatus(**stage) for stage in stages]
-
-
-def build_separation_response(file_id: str, stems: StemsMetadata) -> dict:
-    """Build the separation response payload, preserving the upload/analysis stages."""
-    separation_status = stems.status if stems.status in {'active', 'failed'} else 'completed'
-    separation_message = stems.message or 'Stem separation completed successfully.'
-    if stems.status == 'failed':
-        separation_message = stems.message or 'Stem separation failed.'
-
-    analysis = (SESSIONS.get(file_id) or {}).get('analysis') or {}
-    analysis_status = analysis.get('status', 'completed')
-    analysis_message = analysis.get('message') or 'Analysis completed successfully.'
-
-    workflow_stages = build_stage_dicts(
-        analysis_status,
-        analysis_message,
-        separation_status,
-        separation_message,
-        stems.next_action,
-    )
-    return SeparateResponse(
-        file_id=file_id,
-        stems=stems,
-        workflow_stages=workflow_stage_models(workflow_stages),
-    ).model_dump()
-
-
-def run_separation_task(file_id: str, file_path: str, stems_dir) -> dict:
-    """Execute separation via Celery when available, otherwise run in-process.
-
-    Gated on the broker being reachable for the same reason as
-    ``run_analysis_task`` (fast in-process fallback when Redis is down).
-    """
-    if separate_stems_task is not None and broker_reachable():
-        try:
-            async_result = separate_stems_task.delay(file_id, file_path, str(stems_dir))
-            return async_result.get(timeout=30)
-        except Exception:
-            pass
-    return run_worker_separation(file_id, file_path, stems_dir)
-
-
-@app.post('/api/upload')
-async def upload_audio(file: UploadFile = File(...)):
-    extension = get_file_extension(file.filename)
-    if file.content_type not in ACCEPTED_TYPES or extension not in ACCEPTED_EXTENSIONS:
-        return error_response(
-            'unsupported_audio_format',
-            'Unsupported file type. Only WAV and MP3 are accepted.',
-            f'Content type {file.content_type} and extension {extension} are not both supported.',
-            stage='upload',
-            next_action='Choose a WAV or MP3 file and try again.',
-            workflow_stages=[
-                WorkflowStageStatus(
-                    stage='upload',
-                    status='failed',
-                    message='Upload failed because the selected file type is unsupported.',
-                    next_action='Choose a WAV or MP3 file and try again.',
-                )
-            ],
-        )
-
-    if not is_content_type_extension_compatible(file.content_type, extension):
-        return error_response(
-            'mimetype_extension_mismatch',
-            'Unsupported audio file type.',
-            f'Expected file extension {extension} to match content type {file.content_type}.',
-            stage='upload',
-            next_action='Ensure the selected file extension matches the file type and retry.',
-            workflow_stages=[
-                WorkflowStageStatus(
-                    stage='upload',
-                    status='failed',
-                    message='Upload failed because the MIME type did not match the file extension.',
-                    next_action='Ensure the selected file extension matches the file type and retry.',
-                )
-            ],
-        )
-
+    # 1. Postgres check
     try:
-        await validate_audio_header(file, extension)
-    except ValueError as exc:
-        return error_response(
-            'corrupt_audio',
-            'Uploaded audio appears to be corrupt or invalid.',
-            str(exc),
-            stage='upload',
-            next_action='Try another WAV or MP3 file or export the source again.',
-            workflow_stages=[
-                WorkflowStageStatus(
-                    stage='upload',
-                    status='failed',
-                    message='Upload failed because the audio file did not validate.',
-                    next_action='Try another WAV or MP3 file or export the source again.',
-                )
-            ],
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text('SELECT 1'))
+        checks['database'] = True
+    except Exception as exc:
+        logger.warning('Health check - database failed: %s', exc)
+
+    # 2. Redis check
+    try:
+        redis_client = celery_app.backend.client
+        if redis_client.ping():
+            checks['redis'] = True
+    except Exception as exc:
+        logger.warning('Health check - redis failed: %s', exc)
+
+    # 3. R2 check
+    try:
+        s3 = storage.get_s3_client()
+        settings = storage.get_r2_settings()
+        s3.head_bucket(Bucket=settings['bucket'])
+        checks['storage'] = True
+    except Exception as exc:
+        logger.warning('Health check - R2 storage failed: %s', exc)
+
+    # 4. Celery worker ping
+    try:
+        ping_res = celery_app.control.ping(timeout=1.0)
+        if ping_res and len(ping_res) > 0:
+            checks['worker'] = True
+    except Exception as exc:
+        logger.warning('Health check - worker failed: %s', exc)
+
+    all_healthy = all(checks.values())
+    if not all_healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return {
+        'status': 'ok' if all_healthy else 'degraded',
+        **checks,
+    }
+
+
+# --- API v1 Uploads ---
+@app.post(
+    '/api/v1/uploads/presign',
+    response_model=PresignUploadResponse,
+    tags=['Uploads'],
+)
+def presign_upload(req: PresignUploadRequest, user_id: str = Depends(get_current_user_id)):
+    """Generate a presigned PUT URL for client-direct upload to Cloudflare R2."""
+    if req.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Unsupported content type: {req.content_type}. Allowed: audio/wav, audio/mpeg.',
+        )
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if req.size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f'File size ({req.size_bytes} bytes) exceeds limit of {MAX_UPLOAD_MB} MB.',
         )
 
     file_id = str(uuid.uuid4())
-    filename = f"{file_id}-{Path(file.filename).name}"
-    destination = UPLOAD_DIR / filename
-
-    with destination.open('wb') as buffer:
-        while content := await file.read(1024 * 1024):
-            buffer.write(content)
-
-    local_artifact_url = f"/uploads/{destination.name}"
-    mirrored = _mirror_file(
-        local_path=destination,
-        object_key=f"raw/{file_id}/{destination.name}",
-        content_type=file.content_type,
-        local_url=local_artifact_url,
+    ext = '.mp3' if 'mpeg' in req.content_type or 'mp3' in req.content_type else '.wav'
+    object_key = f'uploads/{file_id}/source{ext}'
+    upload_url = storage.generate_presigned_put_url(
+        object_key=object_key,
+        content_type=req.content_type,
+        expires_in=3600,
     )
-    artifact_url = mirrored['url']
-    SESSIONS[file_id] = {
+
+    return PresignUploadResponse(
+        file_id=file_id,
+        object_key=object_key,
+        upload_url=upload_url,
+        expires_in=3600,
+    )
+
+
+@app.post(
+    '/api/v1/uploads/complete',
+    tags=['Uploads'],
+)
+def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_current_user_id)):
+    """Complete direct upload: verify R2 object, create session, enqueue analysis."""
+    # Verify object exists in R2
+    s3 = storage.get_s3_client()
+    settings = storage.get_r2_settings()
+    try:
+        object_info = s3.head_object(Bucket=settings['bucket'], Key=req.object_key)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Uploaded object not found in R2: {exc}',
+        ) from exc
+
+    object_size = object_info.get('ContentLength')
+    object_type = object_info.get('ContentType')
+    if not isinstance(object_size, int) or object_size < 0:
+        s3.delete_object(Bucket=settings['bucket'], Key=req.object_key)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid object size.')
+    if object_size > MAX_UPLOAD_MB * 1024 * 1024:
+        s3.delete_object(Bucket=settings['bucket'], Key=req.object_key)
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f'File size exceeds {MAX_UPLOAD_MB} MB.')
+    if object_type not in ALLOWED_MIME_TYPES:
+        s3.delete_object(Bucket=settings['bucket'], Key=req.object_key)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unsupported object content type.')
+
+    artifact_url = storage.get_public_url(req.object_key)
+    now_iso = _utcnow_iso()
+    session_data = {
+        'file_id': req.file_id,
+        'user_id': user_id,
+        'filename': req.filename,
+        'content_type': object_type,
+        'size': object_size,
+        'artifact_url': artifact_url,
+        'analysis': {'status': 'pending'},
+        'stems': {'status': 'pending'},
+        'workflow_stages': [
+            {'stage': 'upload', 'status': 'completed', 'message': 'File uploaded directly to storage.'},
+            {'stage': 'analysis', 'status': 'pending', 'message': 'Enqueued for analysis.'},
+        ],
+        'created_at': now_iso,
+    }
+    db_store.save_session(session_data)
+    db_store.save_artifact({
+        'file_id': req.file_id,
+        'name': req.filename,
+        'url': artifact_url,
+        'kind': 'source_audio',
+        'storage_backend': 'r2',
+        'key': req.object_key,
+        'size': object_size,
+        'format': Path(req.filename).suffix.lstrip('.') or 'wav',
+        'mime_type': object_type,
+    })
+
+    # Enqueue analysis task
+    analyze_audio_task.delay(req.file_id, artifact_url)
+
+    return {'file_id': req.file_id, 'status': 'enqueued', 'artifact_url': artifact_url}
+
+
+# --- Multipart Upload (v1 & legacy alias) ---
+@app.post(
+    '/api/v1/upload',
+    response_model=UploadResponse,
+    responses={400: {'model': UploadErrorResponse}},
+    tags=['Uploads'],
+)
+@app.post(
+    '/api/upload',
+    response_model=UploadResponse,
+    responses={400: {'model': UploadErrorResponse}},
+    deprecated=True,
+    tags=['Legacy Aliases'],
+)
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(get_current_user_id)):
+    """Multipart audio upload handler (saves to R2 and creates session)."""
+    if not file.filename:
+        return JSONResponse(
+            status_code=400,
+            content=UploadErrorResponse(
+                error_code='upload_missing_filename',
+                message='No filename provided',
+                next_action='Select a valid audio file to upload',
+            ).model_dump(),
+        )
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in {'.wav', '.mp3'}:
+        return JSONResponse(
+            status_code=400,
+            content=UploadErrorResponse(
+                error_code='upload_invalid_type',
+                message=f'Unsupported file format: {ext}. Only WAV and MP3 are supported.',
+                next_action='Convert your audio file to WAV or MP3 and try again.',
+            ).model_dump(),
+        )
+
+    file_id = str(uuid.uuid4())
+    object_key = f'uploads/{file_id}/{file.filename}'
+    content = await file.read()
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f'File size exceeds {MAX_UPLOAD_MB} MB.',
+        )
+
+    s3 = storage.get_s3_client()
+    settings = storage.get_r2_settings()
+    s3.put_object(
+        Bucket=settings['bucket'],
+        Key=object_key,
+        Body=content,
+        ContentType=file.content_type or 'audio/wav',
+    )
+    artifact_url = storage.get_public_url(object_key)
+    now_iso = _utcnow_iso()
+
+    session_data = {
         'file_id': file_id,
-        'filename': destination.name,
-        'content_type': file.content_type,
-        'size': destination.stat().st_size,
+        'user_id': user_id,
+        'filename': file.filename,
+        'content_type': file.content_type or 'audio/wav',
+        'size': len(content),
         'artifact_url': artifact_url,
         'analysis': None,
+        'stems': None,
         'workflow_stages': [
-            {
-                'stage': 'upload',
-                'status': 'completed',
-                'message': 'Upload completed successfully.',
-            },
-            {
-                'stage': 'analysis',
-                'status': 'pending',
-                'message': 'Analysis has not started yet.',
-            },
+            {'stage': 'upload', 'status': 'completed', 'message': 'File uploaded.'},
         ],
-        'created_at': datetime.now(timezone.utc).isoformat(),
+        'created_at': now_iso,
     }
-    _store_artifact({
+    db_store.save_session(session_data)
+    db_store.save_artifact({
         'file_id': file_id,
-        'name': destination.name,
+        'name': file.filename,
         'url': artifact_url,
-        'kind': 'raw_audio',
-        'storage_backend': mirrored['storage_backend'],
-        'key': mirrored['key'],
-        'size': destination.stat().st_size,
-        'format': extension.lstrip('.'),
-        'mime_type': file.content_type,
+        'kind': 'source_audio',
+        'storage_backend': 'r2',
+        'key': object_key,
+        'size': len(content),
+        'format': ext.lstrip('.'),
+        'mime_type': file.content_type or 'audio/wav',
     })
-    _store_session(SESSIONS[file_id])
-    response = UploadResponse(
+
+    workflow_stages = [
+        WorkflowStageStatus(stage='upload', status='completed', message='File uploaded.'),
+    ]
+    return UploadResponse(
         file_id=file_id,
-        filename=destination.name,
-        content_type=file.content_type,
-        size=destination.stat().st_size,
+        filename=file.filename,
+        content_type=file.content_type or 'audio/wav',
+        size=len(content),
         artifact_url=artifact_url,
-        message='Upload received',
-        workflow_stages=[
-            WorkflowStageStatus(
-                stage='upload',
-                status='completed',
-                message='Upload completed successfully.',
-            ),
-            WorkflowStageStatus(
-                stage='analysis',
-                status='pending',
-                message='Analysis has not started yet.',
-            ),
-        ],
+        message='File uploaded successfully',
+        workflow_stages=workflow_stages,
     )
-    return JSONResponse(response.model_dump())
 
 
-@app.get('/api/session/{file_id}')
-async def get_session(file_id: str):
-    session = _resolve_session(file_id)
+# --- Session Details (v1 & legacy alias) ---
+@app.get('/api/v1/session/{file_id}', tags=['Sessions'])
+@app.get('/api/session/{file_id}', deprecated=True, tags=['Legacy Aliases'])
+def get_session(file_id: str, user_id: str = Depends(get_current_user_id)):
+    """Fetch session details. Users can only access sessions they own."""
+    session = db_store.get_session(file_id)
     if not session:
-        return JSONResponse(status_code=404, content={'message': 'Session not found.'})
-    return JSONResponse(session)
+        raise HTTPException(status_code=404, detail='Session not found')
+    if session.get('user_id') and session.get('user_id') != user_id:
+        raise HTTPException(status_code=403, detail='Access forbidden: session belongs to another user')
+    return session
 
 
-@app.post('/api/analyze', response_model=AnalyzeResponse)
-async def analyze_audio(payload: AnalyzeRequest):
-    session = _resolve_session(payload.file_id)
+# --- Analyze Audio (v1 & legacy alias) ---
+@app.post(
+    '/api/v1/analyze',
+    response_model=AnalyzeResponse,
+    responses={400: {'model': AnalyzeErrorResponse}, 404: {'model': AnalyzeErrorResponse}, 422: {'model': AnalyzeErrorResponse}},
+    tags=['Analysis'],
+)
+@app.post(
+    '/api/analyze',
+    response_model=AnalyzeResponse,
+    deprecated=True,
+    tags=['Legacy Aliases'],
+)
+def analyze(req: AnalyzeRequest, user_id: str = Depends(get_current_user_id)):
+    """Enqueue audio analysis."""
+    session = db_store.get_session(req.file_id)
     if not session:
         return JSONResponse(
             status_code=404,
             content=AnalyzeErrorResponse(
-                error_code='analysis_session_not_found',
-                message='Analysis session was not found.',
-                detail='No upload session exists for the supplied file_id.',
+                error_code='analyze_file_not_found',
+                message='Session not found',
                 stage='analysis',
-                next_action='Upload the audio file again and try analysis.',
-                workflow_stages=[
-                    WorkflowStageStatus(
-                        stage='analysis',
-                        status='failed',
-                        message='Analysis could not start because the session was not found.',
-                        next_action='Upload the audio file again and try analysis.',
-                    )
-                ],
+                next_action='Upload a file first',
             ).model_dump(),
         )
+    if session.get('user_id') and session.get('user_id') != user_id:
+        raise HTTPException(status_code=403, detail='Access forbidden')
 
-    existing_analysis = session.get('analysis')
-    if existing_analysis and existing_analysis.get('status') == 'completed':
-        return JSONResponse(
-            build_analyze_response(payload.file_id, AnalysisMetadata.model_validate(existing_analysis))
-        )
-
-    task_id = str(uuid.uuid4())
-    active_analysis = AnalysisMetadata(
-        status='active',
-        message='Analyzing audio metadata.',
-        task_id=task_id,
+    artifact_url = session.get('artifact_url') or req.artifact_url
+    analyze_audio_task.delay(req.file_id, artifact_url)
+    analysis = session.get('analysis') or {'status': 'pending'}
+    stages = [WorkflowStageStatus(**s) for s in (session.get('workflow_stages') or [])]
+    return AnalyzeResponse(
+        file_id=req.file_id,
+        analysis=AnalysisMetadata(**analysis),
+        workflow_stages=stages,
     )
-    session['analysis'] = active_analysis.model_dump()
-    session['workflow_stages'] = [
-        {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
-        {'stage': 'analysis', 'status': 'active', 'message': 'Analyzing audio metadata.'},
-    ]
 
-    file_path = UPLOAD_DIR / session['filename']
-    if not file_path.exists():
-        failed_analysis = AnalysisMetadata(
-            status='failed',
-            task_id=task_id,
-            message='Analysis failed because the uploaded artifact could not be found.',
-            next_action='Upload the audio file again and retry analysis.',
-        )
-        session['analysis'] = failed_analysis.model_dump()
-        session['workflow_stages'] = [
-            {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
-            {
-                'stage': 'analysis',
-                'status': 'failed',
-                'message': failed_analysis.message,
-                'next_action': failed_analysis.next_action,
-            },
-        ]
-        _store_session(session)
-        return JSONResponse(
-            status_code=422,
-            content=AnalyzeErrorResponse(
-                error_code='analysis_artifact_missing',
-                message=failed_analysis.message or 'Analysis artifact missing.',
-                detail=f'Expected artifact at {file_path}.',
-                stage='analysis',
-                next_action=failed_analysis.next_action,
-                workflow_stages=build_workflow_stages('failed', failed_analysis.message or 'Analysis failed.'),
-            ).model_dump(),
-        )
 
-    try:
-        worker_result = run_analysis_task(payload.file_id, str(file_path))
-    except Exception as exc:
-        failed_analysis = AnalysisMetadata(
-            status='failed',
-            task_id=task_id,
-            message='Analysis failed while processing the uploaded audio.',
-            next_action='Retry analysis or upload a different WAV or MP3 file.',
-        )
-        session['analysis'] = failed_analysis.model_dump()
-        session['workflow_stages'] = [
-            {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
-            {
-                'stage': 'analysis',
-                'status': 'failed',
-                'message': failed_analysis.message,
-                'next_action': failed_analysis.next_action,
-            },
-        ]
-        _store_session(session)
-        return JSONResponse(
-            status_code=500,
-            content=AnalyzeErrorResponse(
-                error_code='analysis_processing_failed',
-                message=failed_analysis.message or 'Analysis failed.',
-                detail=str(exc),
-                stage='analysis',
-                next_action=failed_analysis.next_action,
-                workflow_stages=build_workflow_stages('failed', failed_analysis.message or 'Analysis failed.'),
-            ).model_dump(),
-        )
-
-    # Real analysis (Story 2.4) reports an honest failure through the worker
-    # result instead of fabricating metadata. Surface it (never "completed").
-    if worker_result.get('status') == 'failed':
-        message = worker_result.get('message') or 'Analysis failed while processing the uploaded audio.'
-        next_action = worker_result.get('next_action') or 'Retry analysis or upload a different WAV or MP3 file.'
-        failed_analysis = AnalysisMetadata(
-            status='failed',
-            task_id=task_id,
-            message=message,
-            next_action=next_action,
-        )
-        session['analysis'] = failed_analysis.model_dump()
-        session['workflow_stages'] = [
-            {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
-            {'stage': 'analysis', 'status': 'failed', 'message': message, 'next_action': next_action},
-        ]
-        _store_session(session)
-        return JSONResponse(
-            status_code=422,
-            content=AnalyzeErrorResponse(
-                error_code='analysis_processing_failed',
-                message=message,
-                detail='Real analysis could not be computed from the uploaded audio.',
-                stage='analysis',
-                next_action=next_action,
-                workflow_stages=build_workflow_stages('failed', message),
-            ).model_dump(),
-        )
-
-    completed_analysis = AnalysisMetadata(
-        status='completed',
-        bpm=worker_result.get('bpm'),
-        key=worker_result.get('key'),
-        structure=worker_result.get('structure'),
-        duration=worker_result.get('duration'),
-        waveform_url=worker_result.get('waveform_url'),
-        task_id=task_id,
-        message='Analysis completed successfully.',
-        analyzed_at=worker_result.get('analyzed_at') or datetime.now(timezone.utc).isoformat(),
-    )
-    session['analysis'] = completed_analysis.model_dump()
-    session['workflow_stages'] = [
-        {'stage': 'upload', 'status': 'completed', 'message': 'Upload completed successfully.'},
-        {'stage': 'analysis', 'status': 'completed', 'message': 'Analysis completed successfully.'},
-    ]
-    _store_session(session)
-
-    return JSONResponse(build_analyze_response(payload.file_id, completed_analysis))
-
-@app.post('/api/separate', response_model=SeparateResponse)
-async def separate_audio(payload: SeparateRequest):
-    session = _resolve_session(payload.file_id)
+# --- Separate Stems (v1 & legacy alias) ---
+@app.post(
+    '/api/v1/separate',
+    response_model=SeparateResponse,
+    responses={400: {'model': SeparateErrorResponse}, 404: {'model': SeparateErrorResponse}, 422: {'model': SeparateErrorResponse}},
+    tags=['Separation'],
+)
+@app.post(
+    '/api/separate',
+    response_model=SeparateResponse,
+    deprecated=True,
+    tags=['Legacy Aliases'],
+)
+def separate(req: SeparateRequest, user_id: str = Depends(get_current_user_id)):
+    """Enqueue Demucs stem separation."""
+    session = db_store.get_session(req.file_id)
     if not session:
-        stages = build_stage_dicts(
-            'pending',
-            'Analysis has not started yet.',
-            'failed',
-            'Separation could not start because the session was not found.',
-            'Upload the audio file again and try separation.',
-        )
         return JSONResponse(
             status_code=404,
             content=SeparateErrorResponse(
-                error_code='separation_session_not_found',
-                message='Separation session was not found.',
-                detail='No upload session exists for the supplied file_id.',
+                error_code='separate_file_not_found',
+                message='Session not found',
                 stage='stem_separation',
-                next_action='Upload the audio file again and try separation.',
-                workflow_stages=workflow_stage_models(stages),
+                next_action='Upload a file first',
             ).model_dump(),
         )
+    if session.get('user_id') and session.get('user_id') != user_id:
+        raise HTTPException(status_code=403, detail='Access forbidden')
 
-    existing_stems = session.get('stems')
-    if existing_stems and existing_stems.get('status') == 'completed':
-        return JSONResponse(build_separation_response(payload.file_id, StemsMetadata.model_validate(existing_stems)))
-
-    analysis = session.get('analysis') or {}
-    analysis_status = analysis.get('status', 'pending')
-    if analysis_status == 'completed':
-        analysis_message = analysis.get('message') or 'Analysis completed successfully.'
-    else:
-        analysis_message = analysis.get('message') or 'Analysis has not been completed yet.'
-
-    if analysis_status != 'completed':
-        separation_error = 'Stem separation cannot start because analysis is not complete.'
-        stages = build_stage_dicts(
-            analysis_status,
-            analysis_message,
-            'failed',
-            separation_error,
-            'Run audio analysis first, then retry stem separation.',
-        )
+    artifact_url = session.get('artifact_url')
+    if not artifact_url:
         return JSONResponse(
             status_code=422,
             content=SeparateErrorResponse(
-                error_code='separation_analysis_not_complete',
-                message=separation_error,
-                detail='Analysis must be completed before separating stems.',
+                error_code='separate_missing_artifact',
+                message='Audio artifact URL missing for session',
                 stage='stem_separation',
-                next_action='Run audio analysis first, then retry stem separation.',
-                workflow_stages=workflow_stage_models(stages),
+                next_action='Upload file again',
             ).model_dump(),
         )
 
-    task_id = str(uuid.uuid4())
-    active_stems = StemsMetadata(status='active', message='Separating audio into stems.', task_id=task_id)
-    session['stems'] = active_stems.model_dump()
-    session['workflow_stages'] = build_stage_dicts(analysis_status, analysis_message, 'active', 'Separating audio into stems.')
-
-    file_path = UPLOAD_DIR / session['filename']
-    if not file_path.exists():
-        failed_stems = StemsMetadata(
-            status='failed',
-            task_id=task_id,
-            message='Stem separation failed because the uploaded artifact could not be found.',
-            next_action='Upload the audio file again and retry separation.',
-        )
-        session['stems'] = failed_stems.model_dump()
-        stages = build_stage_dicts(analysis_status, analysis_message, 'failed', failed_stems.message, failed_stems.next_action)
-        session['workflow_stages'] = stages
-        return JSONResponse(
-            status_code=422,
-            content=SeparateErrorResponse(
-                error_code='separation_artifact_missing',
-                message=failed_stems.message or 'Separation artifact missing.',
-                detail=f'Expected artifact at {file_path}.',
-                stage='stem_separation',
-                next_action=failed_stems.next_action,
-                workflow_stages=workflow_stage_models(stages),
-            ).model_dump(),
-        )
-
-    stems_dir = STEM_DIR / session['file_id']
-    try:
-        worker_result = run_separation_task(session['file_id'], str(file_path), stems_dir)
-    except Exception as exc:
-        failed_stems = StemsMetadata(
-            status='failed',
-            task_id=task_id,
-            message='Stem separation failed while processing the uploaded audio.',
-            next_action='Retry separation or upload a different WAV or MP3 file.',
-        )
-        session['stems'] = failed_stems.model_dump()
-        stages = build_stage_dicts(analysis_status, analysis_message, 'failed', failed_stems.message, failed_stems.next_action)
-        session['workflow_stages'] = stages
-        return JSONResponse(
-            status_code=500,
-            content=SeparateErrorResponse(
-                error_code='separation_processing_failed',
-                message=failed_stems.message or 'Stem separation failed.',
-                detail=str(exc),
-                stage='stem_separation',
-                next_action=failed_stems.next_action,
-                workflow_stages=workflow_stage_models(stages),
-            ).model_dump(),
-        )
-
-    # Real separation (Story 2.4) reports an honest failure through the worker
-    # result instead of fabricating byte-identical fake stems. Surface it.
-    if worker_result.get('status') == 'failed':
-        message = worker_result.get('message') or 'Stem separation failed while processing the uploaded audio.'
-        next_action = worker_result.get('next_action') or 'Retry separation or upload a different WAV or MP3 file.'
-        failed_stems = StemsMetadata(
-            status='failed',
-            task_id=task_id,
-            message=message,
-            next_action=next_action,
-        )
-        session['stems'] = failed_stems.model_dump()
-        stages = build_stage_dicts(analysis_status, analysis_message, 'failed', message, next_action)
-        session['workflow_stages'] = stages
-        _store_session(session)
-        return JSONResponse(
-            status_code=422,
-            content=SeparateErrorResponse(
-                error_code='separation_processing_failed',
-                message=message,
-                detail='Real stem separation could not produce distinct stems for the uploaded audio.',
-                stage='stem_separation',
-                next_action=next_action,
-                workflow_stages=workflow_stage_models(stages),
-            ).model_dump(),
-        )
-
-    stem_artifacts = []
-    for stem in worker_result['stems']:
-        stem_local_url = f"/uploads/stems/{session['file_id']}/{stem['filename']}"
-        mirrored = _mirror_file(
-            local_path=stems_dir / stem['filename'],
-            object_key=f"stems/{session['file_id']}/{stem['filename']}",
-            content_type=mime_for_extension(stem.get('format')),
-            local_url=stem_local_url,
-        )
-        _store_artifact({
-            'file_id': session['file_id'],
-            'name': stem['filename'],
-            'url': mirrored['url'],
-            'kind': 'stem',
-            'storage_backend': mirrored['storage_backend'],
-            'key': mirrored['key'],
-            'size': stem.get('size'),
-            'format': stem.get('format'),
-            'mime_type': mime_for_extension(stem.get('format')),
-        })
-        stem_artifacts.append(
-            StemArtifact(
-                name=stem['name'],
-                url=mirrored['url'],
-                size=stem.get('size'),
-                format=stem.get('format'),
-                mime_type=mime_for_extension(stem.get('format')),
-            )
-        )
-    completed_stems = StemsMetadata(
-        status='completed',
-        stems=stem_artifacts,
-        task_id=task_id,
-        method=worker_result.get('method'),
-        message='Stem separation completed successfully.',
-        separated_at=worker_result.get('separated_at') or datetime.now(timezone.utc).isoformat(),
+    separate_stems_task.delay(req.file_id, artifact_url)
+    stems = session.get('stems') or {'status': 'pending', 'stems': []}
+    stages = [WorkflowStageStatus(**s) for s in (session.get('workflow_stages') or [])]
+    return SeparateResponse(
+        file_id=req.file_id,
+        stems=StemsMetadata(**stems),
+        workflow_stages=stages,
     )
-    session['stems'] = completed_stems.model_dump()
-    stages = build_stage_dicts(analysis_status, analysis_message, 'completed', 'Stem separation completed successfully.')
-    session['workflow_stages'] = stages
-    _store_session(session)
-
-    return JSONResponse(build_separation_response(session['file_id'], completed_stems))

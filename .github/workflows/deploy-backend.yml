@@ -1,0 +1,173 @@
+# Secrets needed:
+# - DROPLET_HOST: IP or hostname of mirr-server droplet
+# - DROPLET_SSH_KEY: Private SSH key for deploy user
+# - FRONTEND_REPO_PAT: Personal access token to push to novice-coder-bw/mirr-web
+# - TELEGRAM_BOT_TOKEN: (Optional) Telegram bot token for failure alerts
+# - TELEGRAM_CHAT_ID: (Optional) Telegram chat ID for failure alerts
+
+name: deploy-backend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - 'workers/**'
+      - 'db/**'
+      - 'alembic/**'
+      - 'services/**'
+      - 'shared/**'
+      - 'deploy/**'
+      - 'requirements*.txt'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to deploy (skip CI/build if provided for fast rollback)"
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  ci:
+    if: ${{ !inputs.tag }}
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    if: ${{ !inputs.tag }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/api.Dockerfile
+          push: true
+          tags: ghcr.io/novice-coder-bw/mir-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/worker.Dockerfile
+          push: true
+          tags: ghcr.io/novice-coder-bw/mir-worker:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [build]
+    if: always() && (needs.build.result == 'success' || inputs.tag)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    env:
+      DEPLOY_TAG: ${{ inputs.tag != '' && inputs.tag || github.sha }}
+      DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+      DROPLET_SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DROPLET_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DROPLET_HOST" >> ~/.ssh/known_hosts
+
+      - name: Copy deploy directory to Droplet
+        run: |
+          scp -r deploy/* "deploy@$DROPLET_HOST:/opt/mir/"
+
+      - name: Run release script on Droplet
+        run: |
+          ssh "deploy@$DROPLET_HOST" "bash /opt/mir/release.sh $DEPLOY_TAG"
+
+      - name: Notify on failure (Telegram)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d text="🚨 deploy-backend failed on commit ${{ github.sha }}!" || true
+          fi
+
+  sync-contract:
+    needs: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate openapi.json
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python scripts/export_openapi.py
+
+      - name: Sync OpenAPI spec to frontend repository
+        env:
+          FRONTEND_PAT: ${{ secrets.FRONTEND_REPO_PAT }}
+        run: |
+          if [ -z "$FRONTEND_PAT" ]; then
+            echo "FRONTEND_REPO_PAT not set; skipping contract sync."
+            exit 0
+          fi
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git clone "https://x-access-token:${FRONTEND_PAT}@github.com/novice-coder-bw/mirr-web.git" mirr-web
+          cd mirr-web
+          mkdir -p src/api
+          cp ../openapi.json src/api/openapi.json
+          if git status --porcelain | grep -q "openapi.json"; then
+            git checkout -B api-contract
+            git add src/api/openapi.json
+            git commit -m "chore(api): sync openapi.json contract from backend [skip ci]"
+            git push -f origin api-contract
+            echo "Pushed updated OpenAPI contract to novice-coder-bw/mirr-web branch api-contract."
+
+            # Open PR via GitHub REST API if not already open
+            curl -fsS -X POST \
+              -H "Authorization: Bearer ${FRONTEND_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/novice-coder-bw/mirr-web/pulls \
+              -d '{
+                "title": "chore(api): sync openapi contract from backend",
+                "head": "api-contract",
+                "base": "main",
+                "body": "Automated update of openapi.json contract exported from backend commit ${{ github.sha }}."
+              }' || echo "PR may already exist or cannot be created; continuing."
+          else
+            echo "No contract changes detected."
+          fi

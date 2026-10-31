@@ -1,0 +1,136 @@
+name: provision-droplet
+
+# Creates the mirr-server Droplet through the DigitalOcean API.
+# Run it from github.com (Actions tab > provision-droplet > Run workflow).
+# Needs a repo/environment secret: DIGITALOCEAN_TOKEN (custom-scope token:
+# Droplet create/read, SSH key read, plus whatever the sizes endpoint requires).
+#
+# NOTE: this repo is public, so Actions logs are public. This workflow never
+# prints IP addresses or the token. Read the IPs in the DigitalOcean app.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_key_names:
+        description: "Comma-separated names of SSH keys already added in DigitalOcean (e.g. phone-termius,gh-actions-deploy)"
+        required: true
+        type: string
+      region:
+        description: "DigitalOcean region slug (Supabase is in Paris; fra1 is the closest DO region)"
+        required: true
+        default: fra1
+        type: string
+      size:
+        description: "Droplet size slug"
+        required: true
+        default: s-5-4vcpu-12gb-80gb
+        type: string
+
+permissions:
+  contents: read
+
+concurrency: provision-droplet
+
+jobs:
+  create:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production   # required reviewer = you, approve from the GitHub app
+    env:
+      DO_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+      API: https://api.digitalocean.com/v2
+      NAME: mirr-server
+      REGION: ${{ inputs.region }}
+      SIZE: ${{ inputs.size }}
+      KEY_NAMES: ${{ inputs.ssh_key_names }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight (token, size, existing droplet, SSH keys)
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $DO_TOKEN")
+
+          # 1) Size slug must exist and be available in the region.
+          sizes=$(curl -fsS "${auth[@]}" "$API/sizes?per_page=200")
+          if ! echo "$sizes" | jq -e --arg s "$SIZE" --arg r "$REGION" \
+              '.sizes[] | select(.slug==$s and .available==true and (.regions | index($r)))' >/dev/null; then
+            echo "::error::Size '$SIZE' is not available in '$REGION'. Available 4-vCPU plans in that region:"
+            echo "$sizes" | jq -r --arg r "$REGION" \
+              '.sizes[] | select(.vcpus==4 and .available==true and (.regions | index($r)))
+               | "\(.slug)  \(.memory/1024)GB RAM  \(.disk)GB disk  $\(.price_monthly)/mo"'
+            exit 1
+          fi
+
+          # 2) Refuse to create a duplicate.
+          existing=$(curl -fsS "${auth[@]}" "$API/droplets?name=$NAME" | jq '.droplets | length')
+          if [ "$existing" -gt 0 ]; then
+            echo "::error::A droplet named $NAME already exists. Destroy or rename it first."
+            exit 1
+          fi
+
+          # 3) Resolve key names -> fingerprints.
+          keys=$(curl -fsS "${auth[@]}" "$API/account/keys?per_page=200")
+          fps=$(echo "$keys" | jq -c --arg names "$KEY_NAMES" '
+            ($names | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $n
+            | [.ssh_keys[] | select(.name as $k | any($n[]; . == $k)) | .fingerprint]')
+          want=$(echo "$KEY_NAMES" | tr ',' '\n' | wc -l)
+          got=$(echo "$fps" | jq 'length')
+          if [ "$got" -ne "$want" ]; then
+            echo "::error::Matched $got of $want key names. Keys on the account:"
+            echo "$keys" | jq -r '.ssh_keys[].name'
+            exit 1
+          fi
+          echo "FPS=$fps" >> "$GITHUB_ENV"
+
+      - name: Create droplet
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $DO_TOKEN")
+
+          jq -n \
+            --rawfile ud deploy/cloud-init.yaml \
+            --argjson keys "$FPS" \
+            --arg name "$NAME" --arg region "$REGION" --arg size "$SIZE" '
+            {
+              name: $name,
+              region: $region,
+              size: $size,
+              image: "ubuntu-24-04-x64",
+              ssh_keys: $keys,
+              ipv6: true,
+              monitoring: true,
+              backups: false,
+              tags: ["mirr", "prod"],
+              user_data: $ud
+            }' > body.json
+
+          resp=$(curl -fsS -X POST "$API/droplets" "${auth[@]}" \
+            -H "Content-Type: application/json" -d @body.json)
+          echo "DROPLET_ID=$(echo "$resp" | jq -r '.droplet.id')" >> "$GITHUB_ENV"
+
+      - name: Wait until active and verify networking
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $DO_TOKEN")
+          status=""
+          for i in $(seq 1 50); do
+            d=$(curl -fsS "${auth[@]}" "$API/droplets/$DROPLET_ID")
+            status=$(echo "$d" | jq -r '.droplet.status')
+            [ "$status" = "active" ] && break
+            sleep 6
+          done
+          [ "$status" = "active" ] || { echo "::error::Droplet not active after 5 minutes (status: $status)"; exit 1; }
+
+          v4=$(echo "$d" | jq '[.droplet.networks.v4[]  | select(.type=="public")] | length')
+          v6=$(echo "$d" | jq '[.droplet.networks.v6[]? | select(.type=="public")] | length')
+          {
+            echo "### mirr-server created"
+            echo "- Droplet ID: \`$DROPLET_ID\`"
+            echo "- Region / size: \`$REGION\` / \`$SIZE\`"
+            echo "- Public IPv4 addresses: $v4"
+            echo "- Public IPv6 addresses: $v6"
+            echo "- Read the addresses in the DigitalOcean app (not printed: public logs)."
+            echo "- First boot takes a few minutes; wait for \`/var/lib/cloud/instance/mirr-bootstrap.done\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$v4" -ge 1 ] && [ "$v6" -ge 1 ] || { echo "::error::Expected both public IPv4 and IPv6"; exit 1; }

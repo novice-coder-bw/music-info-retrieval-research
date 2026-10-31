@@ -14,14 +14,14 @@ __pycache__/
 .venv/
 venv/
 env/
-venv/
 .env
 
-# Databases (local SQLite fallbacks)
+# Databases & local data
 *.db
-*.sqlite
-*.sqlite3
+*.sqlite*
 redis-data/
+uploads/
+backend/uploads/
 
 # Build outputs
 dist/
@@ -31,7 +31,17 @@ frontend/.next/
 frontend/.turbo/
 frontend/node_modules/
 frontend/*.tsbuildinfo
-backend/uploads/
+
+# Stray files / tools
+h origin main
+.wget-hsts
+.lightning_studio/
+.cursor-server
+.cursor-server/
+.vscode-server
+.vscode-server/
+.windsurf-server
+.windsurf-server/
 
 # IDE/Editor
 .vscode/
@@ -44,7 +54,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# BMad / Agent related
+# BMad / Agent related (Do not touch managed folders)
 .scratch/
 _bmad/
 _bmad-output/
@@ -56,7 +66,7 @@ _bmad-output/
 .agents/
 skills-lock.json
 
-# Studio / Linux
+# Linux / Shell
 .bashrc
 .bash_history
 .zshrc
@@ -72,26 +82,19 @@ skills-lock.json
 .vimrc
 .gitconfig
 .lesshst
-.lightning_studio/
 .lightningignore
 .sudo_as_admin_successful
-.wget-hsts
 .docker
 .nv/
 .dotnet/
-.cursor-server/
-.vscode-server/
-.windsurf-server/
 .hushlogin
 .condarc
 .ipython/
 .jupyter/
-.kiro/
 .pytest_cache/
 
 *.tmp
 
 # Others | Folders
-
 original-audios
 ai-remakes-audio
