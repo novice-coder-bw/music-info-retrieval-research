@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from moto import mock_aws
 
 # Configure test environment
-os.environ['DATABASE_URL'] = 'postgresql+psycopg://mirr:mirr@localhost:5432/mirr'
+os.environ.setdefault('DATABASE_URL', 'postgresql+psycopg://mirr:mirr@localhost:5432/mirr')
 os.environ['R2_ENDPOINT'] = 'mock://r2'
 os.environ['R2_BUCKET'] = 'music-info-retrieval-research-1'
 os.environ['R2_ACCESS_KEY_ID'] = 'fake-access-key'
