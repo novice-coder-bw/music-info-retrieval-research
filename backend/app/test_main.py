@@ -2,9 +2,9 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 from moto import mock_aws
+from sqlalchemy import event
 
 # Configure test environment
-os.environ['DATABASE_URL'] = 'postgresql+psycopg://mirr:mirr@localhost:5432/mirr'
 os.environ['R2_ENDPOINT'] = 'mock://r2'
 os.environ['R2_BUCKET'] = 'music-info-retrieval-research-1'
 os.environ['R2_ACCESS_KEY_ID'] = 'fake-access-key'
@@ -26,6 +26,22 @@ app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
 client = TestClient(app)
 
 
+@pytest.fixture(scope='module', autouse=True)
+def test_database_connection():
+    # CI's local Postgres has no TLS. Keep the application's required TLS
+    # default intact, but allow the test database URL to choose its SSL mode.
+    db_engine.reset_engine()
+    engine = db_engine.get_engine()
+    sslmode = engine.url.query.get('sslmode', 'prefer')
+
+    @event.listens_for(engine, 'do_connect')
+    def set_test_sslmode(dialect, conn_rec, cargs, cparams):
+        cparams['sslmode'] = sslmode
+
+    yield
+    db_engine.reset_engine()
+
+
 @pytest.fixture(autouse=True)
 def setup_mock_s3():
     with mock_aws():
@@ -44,6 +60,17 @@ def test_sqlite_database_url_raises(monkeypatch):
     monkeypatch.setenv('DATABASE_URL', 'sqlite:///local.db')
     with pytest.raises(RuntimeError, match='SQLite is not supported'):
         db_engine.get_database_url()
+
+
+def test_application_engine_requires_ssl(monkeypatch):
+    settings = {}
+
+    def capture_engine(url, **kwargs):
+        settings.update(kwargs)
+
+    monkeypatch.setattr(db_engine, 'create_engine', capture_engine)
+    db_engine.create_engine_for_url('postgresql+psycopg://user:password@localhost/db')
+    assert settings['connect_args']['sslmode'] == 'require'
 
 
 def test_missing_r2_settings_raises(monkeypatch):
