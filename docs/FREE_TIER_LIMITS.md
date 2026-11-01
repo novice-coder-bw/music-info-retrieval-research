@@ -18,8 +18,7 @@ This document tracks free-tier constraints and limits across all connected servi
 - **Projects**:
   - Up to 2 active free projects.
 - **Backups**:
-  - No daily automated backups on the free tier.
-  - *Mitigation*: The `backup-db.yml` workflow runs `pg_dump` weekly, encrypts the dump with AES-256-CBC, and stores it in Cloudflare R2 (`backups/`) with an 8-week retention window.
+  - No daily automated backups on the free tier; backups: disabled by choice at this stage (empty public schema, data is regenerable).
 
 ---
 
@@ -47,7 +46,6 @@ This document tracks free-tier constraints and limits across all connected servi
   - To prevent old stem files and uploaded tracks from exceeding storage capacity, configure a Lifecycle Rule in Cloudflare R2:
     - Prefix: `uploads/` -> Expire objects after 30 days.
     - Prefix: `stems/` -> Expire objects after 30 days.
-    - Prefix: `backups/` -> Handled by `backup-db.yml` (prunes files older than 56 days / 8 weeks).
 
 ---
 

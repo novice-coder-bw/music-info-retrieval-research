@@ -107,22 +107,38 @@ To migrate historical data from Neon Postgres to Supabase:
 
 ---
 
-## 6. GitHub Secrets & Droplet Environment Variables
+## 6. Backups (not automated)
 
-### GitHub Actions Secrets
-- `DIGITALOCEAN_TOKEN`: DigitalOcean API token with Droplets and SSH Keys permissions.
+Free-tier Supabase does not provide automatic daily backups. Automated database backups are intentionally disabled for now because the public schema starts empty and data is regenerable. Re-add automation once real user data exists.
+
+To perform a manual one-off backup on the Droplet before risky operations or migrations, run:
+
+```bash
+# Source environment and dump using plain postgresql:// URL (stripping +psycopg driver prefix)
+source /opt/mir/.env
+DUMP_URL=$(echo "$DATABASE_URL" | sed 's/+psycopg//')
+pg_dump "$DUMP_URL" --clean --if-exists --no-owner --no-privileges | gzip > "/opt/mir/manual_backup_$(date +%Y%m%d_%H%M%S).sql.gz"
+```
+
+---
+
+## 7. GitHub Secrets & Droplet Environment Variables
+
+### Required GitHub Secrets
+- `DIGITALOCEAN_TOKEN`: DigitalOcean API token with Droplets and SSH Keys permissions (stored in `production` environment).
 - `DROPLET_HOST`: Public IPv4 or domain name of `mirr-server`.
 - `DROPLET_SSH_KEY`: Private SSH key for the `deploy` user.
-- `DATABASE_URL`: Supabase session pooler connection string (port 5432).
-- `BACKUP_PASSPHRASE`: Symmetric encryption passphrase for pg_dump backups.
-- `R2_ENDPOINT`: Cloudflare R2 endpoint URL.
-- `R2_BUCKET`: R2 bucket name (`music-info-retrieval-research-1`).
-- `R2_ACCESS_KEY_ID`: Cloudflare R2 access key.
-- `R2_SECRET_ACCESS_KEY`: Cloudflare R2 secret key.
-- `FRONTEND_REPO_PAT`: GitHub Personal Access Token with repo access to `novice-coder-bw/mirr-web`.
-- `TELEGRAM_BOT_TOKEN`: (Optional) Telegram bot token for failure alerts.
-- `TELEGRAM_CHAT_ID`: (Optional) Telegram chat ID for failure alerts.
-- `HEALTH_URL`: (Optional) Full URL to `https://$DOMAIN/health` for keepalive cron.
+
+### Optional GitHub Secrets
+- `HEALTH_URL`: Full URL to `https://$DOMAIN/health` for keepalive cron.
+- `FRONTEND_REPO_PAT`: Fine-grained GitHub Personal Access Token limited specifically to repository `novice-coder-bw/mirr-web` (used to sync `openapi.json`).
+- `TELEGRAM_BOT_TOKEN`: Telegram bot token for deployment failure alerts.
+- `TELEGRAM_CHAT_ID`: Telegram chat ID for deployment failure alerts.
+
+*(Note: `DATABASE_URL` and `R2_*` credentials are read from `/opt/mir/.env` on the Droplet and are not required as GitHub secrets).*
+
+### Privacy and Object Storage URLs
+By default, the R2 bucket should remain private. When `R2_PUBLIC_BASE_URL` is omitted, the backend generates short-lived presigned GET URLs (1-hour expiry) for artifact streaming and stem playback, ensuring private user audio cannot be accessed publicly without authorization. Setting `R2_PUBLIC_BASE_URL` exposes artifacts to anyone with the object key.
 
 ### Droplet `/opt/mir/.env`
 ```env
@@ -134,7 +150,8 @@ R2_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 R2_BUCKET=music-info-retrieval-research-1
 R2_ACCESS_KEY_ID=<R2_KEY>
 R2_SECRET_ACCESS_KEY=<R2_SECRET>
-R2_PUBLIC_BASE_URL=https://<PUB_BUCKET>.r2.dev
+# Optional: Set R2_PUBLIC_BASE_URL only if public unauthenticated access to audio files is explicitly desired
+# R2_PUBLIC_BASE_URL=https://<PUB_BUCKET>.r2.dev
 SUPABASE_JWKS_URL=https://mghlumhhbjfeqvnmqrjs.supabase.co/auth/v1/.well-known/jwks.json
 CORS_ORIGIN_REGEX=^https:\/\/(.*\.)?(lovable\.app|lovableproject\.com|pages\.dev)$
 MAX_UPLOAD_MB=100

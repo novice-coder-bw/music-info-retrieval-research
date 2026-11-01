@@ -101,9 +101,17 @@ def generate_presigned_put_url(*, object_key: str, content_type: str, expires_in
 
 
 def get_public_url(object_key: str) -> str:
-    """Get public URL for an R2 object."""
+    """Get URL for an R2 object, defaulting to short-lived presigned GET URLs for privacy."""
     settings = get_r2_settings()
     base = settings.get('public_base_url')
     if base:
         return f"{base.rstrip('/')}/{object_key}"
-    return f"{settings['endpoint'].rstrip('/')}/{settings['bucket']}/{object_key}"
+    client = get_s3_client()
+    return client.generate_presigned_url(
+        ClientMethod='get_object',
+        Params={
+            'Bucket': settings['bucket'],
+            'Key': object_key,
+        },
+        ExpiresIn=3600,
+    )
