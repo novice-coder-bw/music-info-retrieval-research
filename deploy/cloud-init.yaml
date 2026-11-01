@@ -1,0 +1,78 @@
+#cloud-config
+# mirr-server host bootstrap.
+# NO SECRETS HERE: user_data is stored by DigitalOcean and readable from the
+# droplet metadata service. Secrets go in /opt/mir/.env after first boot.
+#
+# The app itself (Caddy, FastAPI, Celery worker, Redis) is deployed later by the
+# GitHub Actions deploy workflow, which syncs deploy/ to /opt/mir and runs release.sh.
+
+hostname: mirr-server
+manage_etc_hosts: true
+package_update: true
+package_upgrade: true
+
+packages:
+  - docker.io
+  - docker-compose-v2
+  - git
+  - curl
+  - jq
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - postgresql-client   # pg_dump / psql for the Neon -> Supabase copy and backups
+
+users:
+  - name: deploy
+    gecos: Deploy user
+    shell: /bin/bash
+    groups: [docker]
+    lock_passwd: true
+
+write_files:
+  # Cap container logs so Celery/Demucs output cannot fill the 80 GB disk.
+  - path: /etc/docker/daemon.json
+    permissions: "0644"
+    content: |
+      {"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}
+  # Redis wants overcommit=1; low swappiness keeps Demucs off swap unless needed.
+  - path: /etc/sysctl.d/99-mirr.conf
+    permissions: "0644"
+    content: |
+      vm.overcommit_memory=1
+      vm.swappiness=10
+
+runcmd:
+  # DigitalOcean injects the chosen SSH keys for root only. Reuse them for the
+  # deploy user so both your phone key and the Actions deploy key work.
+  - install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+  - [ sh, -c, "[ -s /root/.ssh/authorized_keys ] && install -m 600 -o deploy -g deploy /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys || true" ]
+  - install -d -o deploy -g deploy /opt/mir
+
+  # Firewall. Only 22/80/443 are open. Redis and the API are never published.
+  # (Docker bypasses ufw for ports it publishes, so keep compose ports to caddy only.)
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow OpenSSH
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+
+  # 2 GB swap as an OOM safety net (12 GB RAM is the real capacity for Demucs).
+  - fallocate -l 2G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - [ sh, -c, "echo '/swapfile none swap sw 0 0' >> /etc/fstab" ]
+  - sysctl --system
+
+  - systemctl restart docker
+  - systemctl enable --now docker fail2ban
+
+  # Lock down SSH ONLY if the deploy user actually got a key, so a failed key
+  # copy cannot lock you out. File name sorts first so it wins over 50-cloud-init.conf.
+  - [ sh, -c, "if [ -s /home/deploy/.ssh/authorized_keys ]; then printf 'PasswordAuthentication no\\nPermitRootLogin no\\nKbdInteractiveAuthentication no\\n' > /etc/ssh/sshd_config.d/00-mirr-hardening.conf && systemctl restart ssh; fi" ]
+
+  - touch /var/lib/cloud/instance/mirr-bootstrap.done
+
+final_message: "mirr-server bootstrap finished after $UPTIME seconds"

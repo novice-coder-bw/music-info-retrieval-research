@@ -1,0 +1,27 @@
+# Web framework & API
+fastapi>=0.112.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.7.0
+python-multipart>=0.0.6
+
+# Task queue & broker (Celery + Redis)
+celery[redis]>=5.4.0
+redis>=5.0.0
+
+# Database & migrations
+SQLAlchemy>=2.0.30,<2.1
+psycopg[binary]>=3.1.18
+alembic>=1.13.0
+
+# Object storage (Cloudflare R2, S3-compatible)
+boto3>=1.34.0
+python-dotenv>=1.0.1
+
+# Authentication
+pyjwt>=2.8.0
+cryptography>=42.0.0
+
+# Testing
+pytest>=8.0.0
+httpx>=0.27.0
+moto[s3]>=5.0.0
