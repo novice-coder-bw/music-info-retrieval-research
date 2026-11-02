@@ -16,7 +16,7 @@ The platform runs on a DigitalOcean Droplet via Docker Compose, backed by **Supa
 | `db/` | SQLAlchemy engine/models/store for Supabase Postgres |
 | `alembic/` | Database migrations for the public schema |
 | `deploy/` | Docker Compose, Caddyfile, Dockerfiles, cloud-init, and release script for Droplet deployment |
-| `.github/workflows/` | CI/CD workflows (testing, image builds, zero-downtime release, ops, and db backup) |
+| `.github/workflows/` | CI/CD workflows (testing, image builds, zero-downtime release, and ops) |
 | `docs/` | Operations runbook (`docs/RUNBOOK.md`) and free-tier limits (`docs/FREE_TIER_LIMITS.md`) |
 
 ## API Endpoints
