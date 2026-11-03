@@ -1,55 +1,33 @@
 # Tech Stack
 
-This document outlines the core technology stack used in the Music Analysis Platform.
+This document details the core technologies used in the Music Analysis Platform.
 
 ## Core Architecture
 
-| Component | Technology |
-| :--- | :--- |
-| **Language** | Python 3.12 |
-| **API Framework** | FastAPI (2026 stable) |
-| **Task Queue** | Celery (2026 stable) |
-| **Message Broker / Result Backend** | Redis (2026 stable) |
-| **Containerization** | Docker |
-| **Database** | Neon Postgres (Managed Serverless) |
-| **Migrations** | Alembic |
-| **Object Storage** | Cloudflare R2 |
-
-## Frontend
-
-| Component | Technology |
-| :--- | :--- |
-| **Framework** | Next.js (2026 stable) |
-| **Library** | React (2026 stable) |
-| **UI Components** | Custom React components (inline styles); shadcn/ui is planned but not yet adopted |
-| **Styling** | CSS (inline styles via React `style`, `globals.css`) — Tailwind CSS not yet adopted |
-| **Audio Visualization** | WaveSurfer.js (2026 stable) |
-| **Icons** | lucide-react |
+| Component | Technology | Description |
+| :--- | :--- | :--- |
+| **Language** | Python 3.12 | Backend and worker runtime |
+| **API Framework** | FastAPI | Async REST API under `/api/v1` |
+| **Task Queue** | Celery 5.x | Background processing with concurrency 1 |
+| **Message Broker** | Redis 7 | Internal Redis broker (appendonly, non-eviction) |
+| **Database** | Supabase Postgres 17 | Hosted in `eu-west-3` (Paris) |
+| **Database Pooler** | Supabase Session Pooler | Port 5432 with `sslmode=require` |
+| **ORM & Migrations** | SQLAlchemy 2.0 + Alembic | Strictly additive schema migrations |
+| **Object Storage** | Cloudflare R2 | S3-compatible storage via boto3 |
+| **Web Server / TLS** | Caddy | Automatic HTTPS and reverse proxying |
+| **Host Environment** | DigitalOcean Droplet | Ubuntu 24.04 (Docker Compose) |
 
 ## Audio Processing & Music Information Retrieval (MIR)
 
 | Library | Purpose |
 | :--- | :--- |
-| **Demucs** | HTDemucs v4 (Source separation) |
-| **Basic-Pitch** | Note detection / Audio-to-MIDI (planned) |
-| **essentia** | Music analysis / Feature extraction (BPM, key, structure) |
-| **pyableton** | Ableton Live integration (planned) |
+| **Demucs (HTDemucs v4)** | Source separation (drums, bass, other, vocals) |
+| **PyTorch (CPU)** | Deep learning model inference for Demucs |
+| **Essentia / Librosa / NumPy** | Feature extraction (BPM, key, structure) |
 
-## Infrastructure & Environment
+## Frontend
 
-### Redis with Docker
-To run Redis locally for development using Docker:
-
-1. **Start Redis Container:**
-   ```bash
-   docker run --name music-redis -p 6379:6379 -d redis:latest
-   ```
-
-2. **Verify it's running:**
-   ```bash
-   docker ps
-   ```
-
-3. **Connection Config:**
-   Ensure your `.env` or configuration files point the Celery broker/backend to:
-   `redis://localhost:6379/0`
+| Component | Repository |
+| :--- | :--- |
+| **Web Client** | `novice-coder-bw/mirr-web` (Lovable project "Stem Studio") |
+| **Client Realtime** | Supabase Realtime subscriptions to `sessions` table |

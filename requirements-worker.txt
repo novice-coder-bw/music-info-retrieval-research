@@ -1,0 +1,10 @@
+# Include API dependencies
+-r requirements.txt
+
+# Audio processing & ML dependencies for Worker
+# Note: In production worker Dockerfile, CPU torch is installed via --extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+torchaudio>=2.2.0
+demucs>=4.0.0
+numpy>=1.24.0
+essentia>=2.1b6.dev1389; platform_system != "Darwin"

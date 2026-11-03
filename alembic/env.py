@@ -1,8 +1,7 @@
 """Alembic environment for the Music Analysis Platform durable store.
 
-The migration URL is resolved from the DATABASE_URL environment variable
-(Neon Postgres in production). When it is unset, a local SQLite file is used
-so the migration can be exercised offline (``alembic upgrade head``).
+Reads DATABASE_URL from environment (Supabase Postgres), ignores Supabase-managed
+schemas (auth, storage, realtime, extensions, vault), and compares only the public schema.
 """
 
 from logging.config import fileConfig
@@ -20,7 +19,7 @@ if str(ROOT_DIR) not in sys.path:
 try:
     from dotenv import load_dotenv
     load_dotenv(ROOT_DIR / '.env')
-except Exception:  # pragma: no cover - optional convenience loader
+except Exception:
     pass
 
 from db.engine import normalize_database_url  # noqa: E402
@@ -31,27 +30,37 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = (
-    os.environ.get('DATABASE_URL', '').strip()
-    or config.get_main_option('sqlalchemy.url')
-)
-# Apply the same psycopg (v3) driver rewrite the app engine uses so a bare
-# 'postgresql://...' DATABASE_URL (as documented in .env.example) resolves to
-# the installed driver instead of the missing psycopg2.
+database_url = os.environ.get('DATABASE_URL', '').strip() or config.get_main_option('sqlalchemy.url')
+if not database_url:
+    raise RuntimeError('DATABASE_URL is required for Alembic migrations.')
+
 database_url = normalize_database_url(database_url)
 config.set_main_option('sqlalchemy.url', database_url)
 
 target_metadata = Base.metadata
 
+IGNORED_SCHEMAS = {'auth', 'storage', 'realtime', 'extensions', 'vault', 'pg_catalog', 'information_schema'}
+
+
+def include_object(object, name, type_, reflected, compare_to):
+    """Only include objects in the public schema, ignoring Supabase-managed schemas."""
+    schema = getattr(object, 'schema', None)
+    if schema in IGNORED_SCHEMAS:
+        return False
+    if type_ == 'table' and schema not in (None, 'public'):
+        return False
+    return True
+
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode (emit SQL without a DB connection)."""
+    """Run migrations in 'offline' mode."""
     context.configure(
         url=database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={'paramstyle': 'named'},
-        render_as_batch=True,
+        include_schemas=False,
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -68,7 +77,8 @@ def run_migrations_online() -> None:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            render_as_batch=True,
+            include_schemas=False,
+            include_object=include_object,
         )
         with context.begin_transaction():
             context.run_migrations()
