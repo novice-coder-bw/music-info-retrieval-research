@@ -1,0 +1,63 @@
+# Git
+.git
+.gitignore
+
+# Python bytecode and caches
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and secrets
+.venv/
+venv/
+env/
+.env*
+
+# Node / Frontend
+node_modules/
+frontend/
+
+# Local data & uploads
+uploads/
+backend/uploads/
+redis-data/
+scratch/
+.scratch/
+original-audios/
+ai-remakes-audio/
+
+# Documentation & specs
+docs/
+BMAD_ORIENTATION.md
+skills-lock.json
+
+# Tests (not needed at runtime in production container)
+conftest.py
+backend/app/test_main.py
+workers/test_tasks.py
+frontend/components/UploadPanel.test.js
+
+# Build artifacts & editor folders
+dist/
+build/
+.vscode/
+.idea/
+.DS_Store
+*.log
+*.tmp
+*.db
+*.sqlite*
+
+# Agent / Tooling metadata
+_bmad/
+_bmad-output/
+.agent/
+.agents/
+.kiro/
+.cline/
+.copilot/
+.pi/
