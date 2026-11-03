@@ -23,7 +23,7 @@ on:
       size:
         description: "Droplet size slug"
         required: true
-        default: s-5-4vcpu-12gb-80gb
+        default: s-2vcpu-2gb
         type: string
 
 permissions:
