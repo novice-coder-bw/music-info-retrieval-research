@@ -3,30 +3,24 @@
 
 ## Music Analysis Platform
 
-MIR platform for stem separation. FastAPI/Node, SQLAlchemy, Celery/Redis. Planning in `.scratch/`, triage labels in `docs/agents/triage-labels.md`.
+MIR platform for stem separation. FastAPI, SQLAlchemy/Alembic, Celery/Redis, Supabase Postgres, and Cloudflare R2.
 
-## Policy
+## Policy & Standing Rules
 
-- Lightning AI Studio: No virtualenvs. Use the single default `python3` environment.
-- Tests must be hermetic: force local storage backends and in-process workers.
-- If Redis/Celery broker is unreachable, fall back to in-process analysis.
-- Do not attempt to create virtualenvs; Studio environment manages dependencies.
-
-## Where things are
-
-- Issues/Specs: `.scratch/<feature-slug>/`
-- Domain context: `CONTEXT.md` and `docs/adr/`
-- Triage vocabulary: `docs/agents/triage-labels.md`
+- **Postgres (Supabase) only**: No SQLite and no local storage fallbacks in any code path.
+- **Durable object storage (Cloudflare R2 only)**: S3-compatible storage via boto3; no local upload fallbacks.
+- **Alembic migrations**:
+  - Every model change requires a new Alembic revision.
+  - Applied revisions are NEVER edited.
+  - Migrations must be strictly additive (expand/contract) so older container images keep working during rolling releases.
+- **Pre-PR checks**: Always run `ruff check .` and `pytest` before opening any PR.
+- **Never commit secrets**: Use environment variable placeholders only.
+- **API evolution**: The public API is strictly additive under `/api/v1` (with `/api/*` retained as deprecated aliases).
 
 ## Running and verifying
 
-- `startup.sh`: installs dependencies and starts Redis (idempotent).
-- `run_all.sh`: runs all services (backend/Celery/frontend).
-- Backend tests: `python3 -m pytest backend/app/test_main.py -q`
-
-## Known pitfalls
-
-- Celery broker issues: do not add long retry loops; the app handles graceful degradation to in-process execution automatically.
-- Database/Persistence: if `DATABASE_URL` is unset, it defaults to SQLite and local uploads. Never assume durability without configuration.
+- Backend tests: `pytest`
+- Linting: `ruff check .`
+- Migrations: `alembic check` / `alembic upgrade head`
 
 <!-- /bmad:context -->
