@@ -74,4 +74,3 @@ python3 -m pytest backend/app/test_main.py -q
 ```
 
 The test suite is hermetic: it forces local storage backends and the in-process worker path, so it never depends on live Postgres, R2, Redis, or a running Celery worker.
-
