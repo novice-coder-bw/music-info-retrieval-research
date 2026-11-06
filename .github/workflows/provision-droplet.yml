@@ -16,9 +16,9 @@ on:
         required: true
         type: string
       region:
-        description: "DigitalOcean region slug (Supabase is in Paris; fra1 is the closest DO region)"
+        description: "DigitalOcean region slug (default mkc1 to avoid DO capacity issues in fra1; Supabase is in Paris)"
         required: true
-        default: fra1
+        default: mkc1
         type: string
       size:
         description: "Droplet size slug"
@@ -55,10 +55,12 @@ jobs:
           sizes=$(curl -fsS "${auth[@]}" "$API/sizes?per_page=200")
           if ! echo "$sizes" | jq -e --arg s "$SIZE" --arg r "$REGION" \
               '.sizes[] | select(.slug==$s and .available==true and (.regions | index($r)))' >/dev/null; then
-            echo "::error::Size '$SIZE' is not available in '$REGION'. Available 4-vCPU plans in that region:"
+            echo "::error::Size '$SIZE' is not available in '$REGION'. Available sizes in that region (prioritizing 2-vCPU plans):"
             echo "$sizes" | jq -r --arg r "$REGION" \
-              '.sizes[] | select(.vcpus==4 and .available==true and (.regions | index($r)))
-               | "\(.slug)  \(.memory/1024)GB RAM  \(.disk)GB disk  $\(.price_monthly)/mo"'
+              '[.sizes[] | select(.available==true and (.regions | index($r)))]
+               | sort_by(if .vcpus == 2 then 0 else 1 end, .vcpus, .price_monthly)
+               | limit(3; .[])
+               | "\(.slug) (\(.vcpus) vCPU, \(.memory/1024)GB RAM, \(.disk)GB disk) - $\(.price_monthly)/mo"'
             exit 1
           fi
 
