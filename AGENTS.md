@@ -72,7 +72,7 @@ You have no credentials and cannot call Supabase, R2, the Droplet or DigitalOcea
 ### Docker and deploy files
 - `deploy/worker.Dockerfile` copies `requirements.txt` **and** `requirements-worker.txt` (the second includes the first). Keep both Dockerfiles building: CI builds them on every PR.
 - Only Caddy publishes ports (80/443). Redis and the API are never exposed. Do not remove `release.sh`'s health check or rollback.
-- Values in `/opt/mir/.env` must be single-quoted because `release.sh` reads the file with bash.
+- Production `.env` is stored at `/mnt/mirr-volume/.env`. `release.sh` parses `DOMAIN` directly and `docker compose --env-file /mnt/mirr-volume/.env` loads configuration without `source`.
 
 ### GitHub Actions
 - The repo is public, so logs are public: never print secrets, IP addresses or database URLs, and pass workflow inputs through `env:` instead of interpolating `${{ inputs.* }}` inside `run:` scripts.
