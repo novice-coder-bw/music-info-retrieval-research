@@ -24,7 +24,7 @@ To provision the `mirr-server` droplet on DigitalOcean using GitHub Actions:
    - Inputs:
      - `ssh_key_names`: Comma-separated names of the registered SSH keys (e.g. `phone-termius,gh-actions-deploy`).
      - `region`: `mkc1` (default, to avoid DigitalOcean capacity restrictions in `fra1`; Supabase is in Paris `eu-west-3`).
-     - `size`: `s-2vcpu-2gb` (preflight will check availability against `/v2/sizes` and report alternatives if unavailable).
+     - `size`: `s5-2vcpu-2gb-30gb` (preflight will check availability against `/v2/sizes` and report alternatives if unavailable).
    - When prompted, approve the deployment in environment `production` via GitHub mobile app.
    - The workflow creates the droplet and verifies public IPv4 and IPv6 assignment. Note that IP addresses are not printed in GitHub logs to preserve privacy on a public repository. Check IP addresses in the DigitalOcean mobile app.
 
