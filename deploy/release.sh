@@ -16,11 +16,23 @@ if [ -z "$NEW_TAG" ]; then
     exit 1
 fi
 
-if [ -f /opt/mir/.env ]; then
-    # shellcheck disable=SC1091
-    source /opt/mir/.env
-else
-    echo "ERROR: /opt/mir/.env not found."
+ENV_FILE="/mnt/mirr-volume/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    # Fallback for backward compatibility if volume is not yet attached
+    if [ -f /opt/mir/.env ]; then
+        ENV_FILE="/opt/mir/.env"
+        echo "WARNING: /mnt/mirr-volume/.env not found, falling back to /opt/mir/.env"
+    else
+        echo "ERROR: Neither /mnt/mirr-volume/.env nor /opt/mir/.env found."
+        exit 1
+    fi
+fi
+
+# Extract DOMAIN safely without sourcing the .env file to prevent bash parsing / syntax errors
+DOMAIN=$(grep -E '^[[:space:]]*DOMAIN[[:space:]]*=' "$ENV_FILE" | tail -n 1 | cut -d '=' -f2- | tr -d '"' | tr -d "'" | tr -d '\r' | tr -d ' ')
+
+if [ -z "$DOMAIN" ]; then
+    echo "ERROR: DOMAIN variable not found in $ENV_FILE"
     exit 1
 fi
 
@@ -33,14 +45,14 @@ echo ">> Starting release for TAG=$NEW_TAG (Previous TAG=$PREV_TAG)"
 export TAG="$NEW_TAG"
 
 echo ">> Pulling container images..."
-docker compose pull api worker
+docker compose --env-file "$ENV_FILE" pull api worker
 
 echo ">> Running database migrations (alembic upgrade head)..."
 # Additive migrations only; not rolled back on container failure
-docker compose run --rm api alembic upgrade head
+docker compose --env-file "$ENV_FILE" run --rm api alembic upgrade head
 
 echo ">> Starting new containers..."
-docker compose up -d --remove-orphans
+docker compose --env-file "$ENV_FILE" up -d --remove-orphans
 
 echo ">> Verifying health check at https://${DOMAIN}/health (up to 100s)..."
 HEALTH_OK=0
@@ -62,7 +74,7 @@ else
     echo "::error::Health check failed after 100 seconds! Rolling back to PREV_TAG=$PREV_TAG"
     if [ -n "$PREV_TAG" ]; then
         export TAG="$PREV_TAG"
-        docker compose up -d --remove-orphans
+        docker compose --env-file "$ENV_FILE" up -d --remove-orphans
         echo "$PREV_TAG" > /opt/mir/.tag
         echo ">> Rollback completed."
     else
