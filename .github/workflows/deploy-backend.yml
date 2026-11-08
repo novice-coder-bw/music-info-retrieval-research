@@ -28,7 +28,7 @@ on:
         required: false
         type: string
       sync_env:
-        description: "Force sync PROD_ENV_FILE secret to /mnt/mirr-volume/.env"
+        description: "Force sync PROD_ENV_FILE secret to /mnt/mirr_volume/.env"
         required: false
         type: boolean
         default: false
@@ -145,15 +145,19 @@ jobs:
             sed -e 's/[“”]/"/g' -e "s/[‘’]/'/g" -e 's/[—–]/-/g' | \
             base64 -w 0)
 
-          echo ">> Injecting sanitized .env atomically to /mnt/mirr-volume/.env via base64..."
+          echo ">> Injecting sanitized .env atomically to /mnt/mirr_volume/.env via base64..."
           ssh "deploy@$DROPLET_HOST" bash -s -- "$SANITIZED_B64" << 'REMOTE_SCRIPT'
             set -euo pipefail
             B64_DATA="$1"
 
-            TARGET_DIR="/mnt/mirr-volume"
+            TARGET_DIR="/mnt/mirr_volume"
             if [ ! -d "$TARGET_DIR" ]; then
-              echo "WARNING: $TARGET_DIR does not exist. Falling back to /opt/mir for .env placement."
-              TARGET_DIR="/opt/mir"
+              if [ -d "/mnt/mirr-volume" ]; then
+                TARGET_DIR="/mnt/mirr-volume"
+              else
+                echo "WARNING: $TARGET_DIR does not exist. Falling back to /opt/mir for .env placement."
+                TARGET_DIR="/opt/mir"
+              fi
             fi
 
             TMP_FILE="${TARGET_DIR}/.env.tmp.$$"

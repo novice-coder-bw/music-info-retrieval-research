@@ -68,7 +68,7 @@ Row Level Security is enabled on these tables (Supabase exposes `public` through
 
 ## Configuration
 
-Production settings live in `/mnt/mirr-volume/.env` on the Droplet (never in git; deploys preserve it or sync safely via Base64). `.env.example` lists every variable with placeholders.
+Production settings live in `/mnt/mirr_volume/.env` on the Droplet (never in git; deploys preserve it or sync safely via Base64). `.env.example` lists every variable with placeholders.
 
 | Variable | Notes |
 | :--- | :--- |
@@ -84,7 +84,7 @@ Production settings live in `/mnt/mirr-volume/.env` on the Droplet (never in git
 
 Rules that have caused real failures:
 
-- **Single-quote every value** in `/mnt/mirr-volume/.env` (for example `CORS_ORIGIN_REGEX='^https:\/\/...$'`). `release.sh` parses `DOMAIN` directly and `docker compose --env-file /mnt/mirr-volume/.env` loads environment variables without shell sourcing.
+- **Single-quote every value** in `/mnt/mirr_volume/.env` (for example `CORS_ORIGIN_REGEX='^https:\/\/...$'`). `release.sh` parses `DOMAIN` directly and `docker compose --env-file /mnt/mirr_volume/.env` loads environment variables without shell sourcing.
 - **Passwords in `DATABASE_URL`:** percent-encode special characters (`@` is `%40`) or use letters and digits only. A stray `@` makes the host parse wrongly and the error message prints part of the URL into the (public) Actions log. Rotate the password if that happens.
 - Use the `+psycopg` driver prefix for the app and Alembic, but a **plain `postgresql://` URL for `pg_dump`/`psql`**.
 - Copy the exact pooler host from Supabase → Connect; the example host in `.env.example` may not match your project.
