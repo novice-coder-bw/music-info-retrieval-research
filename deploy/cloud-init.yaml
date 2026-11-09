@@ -49,6 +49,27 @@ runcmd:
   - [ sh, -c, "[ -s /root/.ssh/authorized_keys ] && install -m 600 -o deploy -g deploy /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys || true" ]
   - install -d -o deploy -g deploy /opt/mir
 
+  # Persistent volume mount detection, permissions, and compatibility symlink
+  - [ sh, -c, '
+      for i in $(seq 1 30); do
+        if mountpoint -q /mnt/mirr-volume || mountpoint -q /mnt/mirr_volume; then
+          break
+        fi
+        sleep 2
+      done
+
+      # Standardize on /mnt/mirr-volume and grant ownership to deploy
+      if mountpoint -q /mnt/mirr-volume; then
+        chown -R deploy:deploy /mnt/mirr-volume
+        chmod 750 /mnt/mirr-volume
+        ln -sfn /mnt/mirr-volume /mnt/mirr_volume
+      elif mountpoint -q /mnt/mirr_volume; then
+        chown -R deploy:deploy /mnt/mirr_volume
+        chmod 750 /mnt/mirr_volume
+        ln -sfn /mnt/mirr_volume /mnt/mirr-volume
+      fi
+    ' ]
+
   # Firewall. Only 22/80/443 are open. Redis and the API are never published.
   # (Docker bypasses ufw for ports it publishes, so keep compose ports to caddy only.)
   - ufw default deny incoming

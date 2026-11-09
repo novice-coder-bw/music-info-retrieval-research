@@ -85,6 +85,34 @@ jobs:
           fi
           echo "FPS=$fps" >> "$GITHUB_ENV"
 
+      - name: Ensure persistent block storage volume exists
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $DO_TOKEN")
+
+          echo ">> Checking if volume 'mirr-volume' exists in region $REGION..."
+          vols=$(curl -fsS "${auth[@]}" "$API/volumes?name=mirr-volume&region=$REGION")
+          vol_id=$(echo "$vols" | jq -r '.volumes[0].id // empty')
+
+          if [ -z "$vol_id" ]; then
+            echo ">> Volume 'mirr-volume' not found. Creating 1GB ext4 volume in $REGION..."
+            create_resp=$(curl -fsS -X POST "$API/volumes" "${auth[@]}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "size_gigabytes": 1,
+                "name": "mirr-volume",
+                "description": "Persistent storage volume for mirr production .env",
+                "region": "'"$REGION"'",
+                "filesystem_type": "ext4",
+                "filesystem_label": "mirr-volume"
+              }')
+            vol_id=$(echo "$create_resp" | jq -r '.volume.id')
+            echo ">> Created volume mirr-volume (ID: $vol_id)"
+          else
+            echo ">> Found existing volume mirr-volume (ID: $vol_id)"
+          fi
+          echo "VOLUME_ID=$vol_id" >> "$GITHUB_ENV"
+
       - name: Create droplet
         run: |
           set -euo pipefail
@@ -93,6 +121,7 @@ jobs:
           jq -n \
             --rawfile ud deploy/cloud-init.yaml \
             --argjson keys "$FPS" \
+            --arg vol "$VOLUME_ID" \
             --arg name "$NAME" --arg region "$REGION" --arg size "$SIZE" '
             {
               name: $name,
@@ -100,6 +129,7 @@ jobs:
               size: $size,
               image: "ubuntu-24-04-x64",
               ssh_keys: $keys,
+              volumes: [$vol],
               ipv6: true,
               monitoring: true,
               backups: false,
