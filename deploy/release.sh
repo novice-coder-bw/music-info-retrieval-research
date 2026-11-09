@@ -16,16 +16,16 @@ if [ -z "$NEW_TAG" ]; then
     exit 1
 fi
 
-ENV_FILE="/mnt/mirr_volume/.env"
+ENV_FILE="/mnt/mirr-volume/.env"
 if [ ! -f "$ENV_FILE" ]; then
-    if [ -f /mnt/mirr-volume/.env ]; then
-        ENV_FILE="/mnt/mirr-volume/.env"
-        echo "WARNING: Using legacy volume path /mnt/mirr-volume/.env"
+    if [ -f /mnt/mirr_volume/.env ]; then
+        ENV_FILE="/mnt/mirr_volume/.env"
+        echo "WARNING: Using legacy volume path /mnt/mirr_volume/.env"
     elif [ -f /opt/mir/.env ]; then
         ENV_FILE="/opt/mir/.env"
         echo "WARNING: Volume .env not found, falling back to /opt/mir/.env"
     else
-        echo "ERROR: Neither /mnt/mirr_volume/.env, /mnt/mirr-volume/.env, nor /opt/mir/.env found."
+        echo "ERROR: Neither /mnt/mirr-volume/.env, /mnt/mirr_volume/.env, nor /opt/mir/.env found."
         exit 1
     fi
 fi

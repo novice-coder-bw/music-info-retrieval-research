@@ -43,11 +43,11 @@ To provision the `mirr-server` droplet on DigitalOcean using GitHub Actions:
 1. Wait for `/var/lib/cloud/instance/mirr-bootstrap.done` to be created.
 2. Verify DNS records:
    - Point your DNS `A` record (IPv4) and `AAAA` record (IPv6) to the Droplet's public IPs.
-3. Configure `/mnt/mirr_volume/.env` on the Droplet (as user `deploy` or `root`):
+3. Configure `/mnt/mirr-volume/.env` on the Droplet (as user `deploy` or `root`):
    ```bash
-   install -d -o deploy -g deploy /mnt/mirr_volume
-   # Create /mnt/mirr_volume/.env with required production environment variables (see Section 6)
-   chmod 600 /mnt/mirr_volume/.env
+   install -d -o deploy -g deploy /mnt/mirr-volume
+   # Create /mnt/mirr-volume/.env with required production environment variables (see Section 6)
+   chmod 600 /mnt/mirr-volume/.env
    ```
 4. Initial deployment:
    - Run the GitHub Actions `deploy-backend.yml` workflow to build images, push to GHCR, copy configuration, run Alembic migrations, and start Docker Compose services.
@@ -116,7 +116,7 @@ To perform a manual one-off backup on the Droplet before risky operations or mig
 
 ```bash
 # Read DATABASE_URL safely from persistent volume and dump using plain postgresql:// URL (stripping +psycopg driver prefix)
-DATABASE_URL=$(grep -E '^[[:space:]]*DATABASE_URL[[:space:]]*=' /mnt/mirr_volume/.env | tail -n 1 | cut -d '=' -f2- | tr -d '"' | tr -d "'" | tr -d '\r' | tr -d ' ')
+DATABASE_URL=$(grep -E '^[[:space:]]*DATABASE_URL[[:space:]]*=' /mnt/mirr-volume/.env | tail -n 1 | cut -d '=' -f2- | tr -d '"' | tr -d "'" | tr -d '\r' | tr -d ' ')
 DUMP_URL=$(echo "$DATABASE_URL" | sed 's/+psycopg//')
 pg_dump "$DUMP_URL" --clean --if-exists --no-owner --no-privileges | gzip > "/opt/mir/manual_backup_$(date +%Y%m%d_%H%M%S).sql.gz"
 ```
@@ -131,18 +131,18 @@ pg_dump "$DUMP_URL" --clean --if-exists --no-owner --no-privileges | gzip > "/op
 - `DROPLET_SSH_KEY`: Private SSH key for the `deploy` user.
 
 ### Optional GitHub Secrets
-- `PROD_ENV_FILE`: Raw text or Base64-encoded content of `/mnt/mirr_volume/.env`. When present, GitHub Actions automatically sanitizes mobile formatting errors (smart quotes, CRLF, unicode dashes) and delivers it atomically via Base64 decoding over SSH.
+- `PROD_ENV_FILE`: Raw text or Base64-encoded content of `/mnt/mirr-volume/.env`. When present, GitHub Actions automatically sanitizes mobile formatting errors (smart quotes, CRLF, unicode dashes) and delivers it atomically via Base64 decoding over SSH.
 - `HEALTH_URL`: Full URL to `https://$DOMAIN/health` for keepalive cron.
 - `FRONTEND_REPO_PAT`: Fine-grained GitHub Personal Access Token limited specifically to repository `novice-coder-bw/mirr-web` (used to sync `openapi.json`).
 - `TELEGRAM_BOT_TOKEN`: Telegram bot token for deployment failure alerts.
 - `TELEGRAM_CHAT_ID`: Telegram chat ID for deployment failure alerts.
 
-*(Note: `DATABASE_URL` and `R2_*` credentials are read from `/mnt/mirr_volume/.env` on the Droplet and can be managed directly on the volume or injected via `PROD_ENV_FILE`).*
+*(Note: `DATABASE_URL` and `R2_*` credentials are read from `/mnt/mirr-volume/.env` on the Droplet and can be managed directly on the volume or injected via `PROD_ENV_FILE`).*
 
 ### Privacy and Object Storage URLs
 By default, the R2 bucket should remain private. When `R2_PUBLIC_BASE_URL` is omitted, the backend generates short-lived presigned GET URLs (1-hour expiry) for artifact streaming and stem playback, ensuring private user audio cannot be accessed publicly without authorization. Setting `R2_PUBLIC_BASE_URL` exposes artifacts to anyone with the object key.
 
-### Droplet `/mnt/mirr_volume/.env`
+### Droplet `/mnt/mirr-volume/.env`
 ```env
 DOMAIN=api.yourdomain.com
 TAG=latest

@@ -28,7 +28,7 @@ on:
         required: false
         type: string
       sync_env:
-        description: "Force sync PROD_ENV_FILE secret to /mnt/mirr_volume/.env"
+        description: "Force sync PROD_ENV_FILE secret to /mnt/mirr-volume/.env"
         required: false
         type: boolean
         default: false
@@ -145,19 +145,27 @@ jobs:
             sed -e 's/[“”]/"/g' -e "s/[‘’]/'/g" -e 's/[—–]/-/g' | \
             base64 -w 0)
 
-          echo ">> Injecting sanitized .env atomically to /mnt/mirr_volume/.env via base64..."
+          echo ">> Injecting sanitized .env atomically to /mnt/mirr-volume/.env via base64..."
           ssh "deploy@$DROPLET_HOST" bash -s -- "$SANITIZED_B64" << 'REMOTE_SCRIPT'
             set -euo pipefail
             B64_DATA="$1"
 
-            TARGET_DIR="/mnt/mirr_volume"
+            TARGET_DIR="/mnt/mirr-volume"
+            # Support legacy /mnt/mirr_volume if /mnt/mirr-volume does not exist
+            if [ ! -d "$TARGET_DIR" ] && [ -d "/mnt/mirr_volume" ]; then
+              TARGET_DIR="/mnt/mirr_volume"
+            fi
+
+            # Fail-fast check: directory must exist and be writable by deploy user
             if [ ! -d "$TARGET_DIR" ]; then
-              if [ -d "/mnt/mirr-volume" ]; then
-                TARGET_DIR="/mnt/mirr-volume"
-              else
-                echo "WARNING: $TARGET_DIR does not exist. Falling back to /opt/mir for .env placement."
-                TARGET_DIR="/opt/mir"
-              fi
+              echo "::error::Volume mount directory $TARGET_DIR does not exist on Droplet! Verify block storage volume attachment."
+              exit 1
+            fi
+
+            if [ ! -w "$TARGET_DIR" ]; then
+              echo "::error::Permission denied: deploy user cannot write to $TARGET_DIR."
+              echo "::error::Fix on Droplet: sudo chown -R deploy:deploy $TARGET_DIR && sudo chmod 750 $TARGET_DIR"
+              exit 1
             fi
 
             TMP_FILE="${TARGET_DIR}/.env.tmp.$$"
@@ -173,6 +181,13 @@ jobs:
 
             mv "$TMP_FILE" "${TARGET_DIR}/.env"
             echo ">> Successfully updated ${TARGET_DIR}/.env"
+
+            # If alternate directory exists, keep symlinked for consistency
+            if [ "$TARGET_DIR" = "/mnt/mirr-volume" ] && [ ! -e "/mnt/mirr_volume" ]; then
+              ln -sfn /mnt/mirr-volume /mnt/mirr_volume 2>/dev/null || true
+            elif [ "$TARGET_DIR" = "/mnt/mirr_volume" ] && [ ! -e "/mnt/mirr-volume" ]; then
+              ln -sfn /mnt/mirr_volume /mnt/mirr-volume 2>/dev/null || true
+            fi
           REMOTE_SCRIPT
 
       - name: Validate tag and run release script on Droplet
