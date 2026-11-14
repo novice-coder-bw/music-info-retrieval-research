@@ -36,7 +36,7 @@ Read `README.md` first for the architecture, API and configuration. This file sa
 - **Data**: SQLAlchemy models in `db/models.py`, queries in `db/store.py`, engine in `db/engine.py`, migrations in `alembic/versions/`. Supabase Postgres via the session pooler.
 - **Storage**: `services/storage.py` (Cloudflare R2 through boto3; presigned PUT and GET).
 - **Schemas**: `shared/schemas.py` (Pydantic request/response models, the API contract).
-- **Deploy**: `deploy/` (Dockerfiles, Compose, Caddyfile, `release.sh`, `cloud-init.yaml`) and `.github/workflows/`. Runs on a DigitalOcean Droplet.
+- **Deploy**: `deploy/` (Dockerfiles, Compose, Caddyfile, `release.sh`, `cloud-init.yaml`) and `.github/workflows/`. Runs on a DigitalOcean Droplet. Production config is `/opt/mir/.env` (no block volume).
 - **Frontend**: separate repo `novice-coder-bw/mirr-web` (Cloudflare Workers, also edited with Lovable). It consumes this repo's `/openapi.json`.
 
 ## You cannot reach production
@@ -72,7 +72,7 @@ You have no credentials and cannot call Supabase, R2, the Droplet or DigitalOcea
 ### Docker and deploy files
 - `deploy/worker.Dockerfile` copies `requirements.txt` **and** `requirements-worker.txt` (the second includes the first). Keep both Dockerfiles building: CI builds them on every PR.
 - Only Caddy publishes ports (80/443). Redis and the API are never exposed. Do not remove `release.sh`'s health check or rollback.
-- Production `.env` is stored at `/mnt/mirr-volume/.env`. `release.sh` parses `DOMAIN` directly and `docker compose --env-file /mnt/mirr-volume/.env` loads configuration without `source`.
+- Production `.env` is **`/opt/mir/.env`**. `release.sh` parses `DOMAIN` from that file; `docker compose --env-file /opt/mir/.env` loads it without `source`.
 
 ### GitHub Actions
 - The repo is public, so logs are public: never print secrets, IP addresses or database URLs, and pass workflow inputs through `env:` instead of interpolating `${{ inputs.* }}` inside `run:` scripts.
