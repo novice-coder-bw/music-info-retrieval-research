@@ -5,6 +5,11 @@
 #
 # The app itself (Caddy, FastAPI, Celery worker, Redis) is deployed later by the
 # GitHub Actions deploy workflow, which syncs deploy/ to /opt/mir and runs release.sh.
+#
+# Block volume: provision-droplet attaches mirr-volume after create. This script
+# waits for the device, mounts it at /mnt/mirr-volume (without reformatting),
+# ensures fstab, then chowns. If the mount never appears, bootstrap fails so
+# the deploy workflow does not hit a silent permission race.
 
 hostname: mirr-server
 manage_etc_hosts: true
@@ -20,7 +25,7 @@ packages:
   - ufw
   - fail2ban
   - unattended-upgrades
-  - postgresql-client   # pg_dump / psql for the Neon -> Supabase copy and backups
+  - postgresql-client   # pg_dump / psql for backups
 
 users:
   - name: deploy
@@ -49,25 +54,82 @@ runcmd:
   - [ sh, -c, "[ -s /root/.ssh/authorized_keys ] && install -m 600 -o deploy -g deploy /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys || true" ]
   - install -d -o deploy -g deploy /opt/mir
 
-  # Persistent volume mount detection, permissions, and compatibility symlink
+  # --- Persistent volume: wait, mount (no format), fstab, chown, or fail ---
   - [ sh, -c, '
-      for i in $(seq 1 30); do
-        if mountpoint -q /mnt/mirr-volume || mountpoint -q /mnt/mirr_volume; then
-          break
-        fi
-        sleep 2
-      done
+      set -eu
+      MNT=/mnt/mirr-volume
+      DEV_BY_ID=/dev/disk/by-id/scsi-0DO_Volume_mirr-volume
+      LABEL=mirr-volume
+      TIMEOUT_SECS=180
+      elapsed=0
 
-      # Standardize on /mnt/mirr-volume and grant ownership to deploy
-      if mountpoint -q /mnt/mirr-volume; then
-        chown -R deploy:deploy /mnt/mirr-volume
-        chmod 750 /mnt/mirr-volume
-        ln -sfn /mnt/mirr-volume /mnt/mirr_volume
-      elif mountpoint -q /mnt/mirr_volume; then
-        chown -R deploy:deploy /mnt/mirr_volume
-        chmod 750 /mnt/mirr_volume
-        ln -sfn /mnt/mirr_volume /mnt/mirr-volume
+      mkdir -p "$MNT"
+
+      # Already mounted at the canonical path?
+      if mountpoint -q "$MNT"; then
+        echo "mirr-volume already mounted at $MNT"
+      else
+        # Wait for the block device or an auto-mount (DO sometimes mounts first).
+        while [ "$elapsed" -lt "$TIMEOUT_SECS" ]; do
+          if mountpoint -q "$MNT" || mountpoint -q /mnt/mirr_volume; then
+            break
+          fi
+          if [ -e "$DEV_BY_ID" ] || [ -e /dev/disk/by-label/"$LABEL" ]; then
+            break
+          fi
+          sleep 3
+          elapsed=$((elapsed + 3))
+        done
+
+        if mountpoint -q /mnt/mirr_volume && ! mountpoint -q "$MNT"; then
+          ln -sfn /mnt/mirr_volume "$MNT"
+        fi
+
+        if ! mountpoint -q "$MNT"; then
+          # Resolve device: prefer by-id, then by-label. Never format.
+          DEV=""
+          if [ -e "$DEV_BY_ID" ]; then
+            DEV=$(readlink -f "$DEV_BY_ID")
+          elif [ -e /dev/disk/by-label/"$LABEL" ]; then
+            DEV=$(readlink -f /dev/disk/by-label/"$LABEL")
+          fi
+
+          if [ -z "$DEV" ] || [ ! -b "$DEV" ]; then
+            echo "ERROR: mirr-volume block device not found within ${TIMEOUT_SECS}s" >&2
+            ls -la /dev/disk/by-id/ 2>/dev/null || true
+            exit 1
+          fi
+
+          # Mount existing filesystem only (do not mkfs).
+          mount -o defaults,nofail,discard,noatime "$DEV" "$MNT" || {
+            echo "ERROR: failed to mount $DEV on $MNT" >&2
+            exit 1
+          }
+        fi
+
+        # Persist across reboot if fstab entry missing.
+        if ! grep -qE "[[:space:]]$MNT[[:space:]]" /etc/fstab 2>/dev/null; then
+          # Prefer label for stability if present, else UUID.
+          if [ -e /dev/disk/by-label/"$LABEL" ]; then
+            echo "LABEL=$LABEL $MNT ext4 defaults,nofail,discard,noatime 0 2" >> /etc/fstab
+          else
+            UUID=$(blkid -s UUID -o value "$DEV" 2>/dev/null || true)
+            if [ -n "$UUID" ]; then
+              echo "UUID=$UUID $MNT ext4 defaults,nofail,discard,noatime 0 2" >> /etc/fstab
+            fi
+          fi
+        fi
       fi
+
+      if ! mountpoint -q "$MNT"; then
+        echo "ERROR: $MNT is not a mount point after wait/mount" >&2
+        exit 1
+      fi
+
+      chown -R deploy:deploy "$MNT"
+      chmod 750 "$MNT"
+      ln -sfn "$MNT" /mnt/mirr_volume
+      echo "mirr-volume ready at $MNT (owned by deploy)"
     ' ]
 
   # Firewall. Only 22/80/443 are open. Redis and the API are never published.
@@ -79,7 +141,7 @@ runcmd:
   - ufw allow 443/tcp
   - ufw --force enable
 
-  # 2 GB swap as an OOM safety net (12 GB RAM is the real capacity for Demucs).
+  # 2 GB swap as an OOM safety net.
   - fallocate -l 2G /swapfile
   - chmod 600 /swapfile
   - mkswap /swapfile

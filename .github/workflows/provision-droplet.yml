@@ -97,12 +97,130 @@ jobs:
           echo ">> Checking if volume '$VOLUME_NAME' exists in region $REGION..."
           vols=$(curl -fsS "${auth[@]}" "$API/volumes?name=$VOLUME_NAME&region=$REGION")
           vol_id=$(echo "$vols" | jq -r '.volumes[0].id // empty')
-          droplet_ids=$(echo "$vols" | jq -c '.volumes[0].droplet_ids // []')
+          attached=$(echo "$vols" | jq -r '(.volumes[0].droplet_ids // []) | length')
 
           if [ -z "$vol_id" ]; then
             echo ">> Volume '$VOLUME_NAME' not found. Creating 1GB ext4 volume in $REGION..."
             create_resp=$(curl -fsS -X POST "$API/volumes" "${auth[@]}" \
               -H "Content-Type: application/json" \
-              -d '{
-                "size_gigabytes": 1,
-                "name": "'
+              -d "{
+                \"size_gigabytes\": 1,
+                \"name\": \"$VOLUME_NAME\",
+                \"description\": \"Persistent storage volume for mirr production .env\",
+                \"region\": \"$REGION\",
+                \"filesystem_type\": \"ext4\",
+                \"filesystem_label\": \"$VOLUME_NAME\"
+              }")
+            vol_id=$(echo "$create_resp" | jq -r '.volume.id')
+            echo ">> Created volume $VOLUME_NAME"
+          else
+            echo ">> Found existing volume $VOLUME_NAME"
+            if [ "$attached" -gt 0 ]; then
+              echo "::error::Volume $VOLUME_NAME is already attached to another Droplet. Detach it first."
+              exit 1
+            fi
+          fi
+          echo "VOLUME_ID=$vol_id" >> "$GITHUB_ENV"
+
+      - name: Create droplet (without volume ID in payload)
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $DO_TOKEN")
+
+          # Do NOT pass volumes: [...] here. DO REST API attach-at-create is
+          # unreliable / unsupported for existing volume IDs; we attach next.
+          jq -n \
+            --rawfile ud deploy/cloud-init.yaml \
+            --argjson keys "$FPS" \
+            --arg name "$NAME" --arg region "$REGION" --arg size "$SIZE" '
+            {
+              name: $name,
+              region: $region,
+              size: $size,
+              image: "ubuntu-24-04-x64",
+              ssh_keys: $keys,
+              ipv6: true,
+              monitoring: true,
+              backups: false,
+              tags: ["mirr", "prod"],
+              user_data: $ud
+            }' > body.json
+
+          resp=$(curl -fsS -X POST "$API/droplets" "${auth[@]}" \
+            -H "Content-Type: application/json" -d @body.json)
+          echo "DROPLET_ID=$(echo "$resp" | jq -r '.droplet.id')" >> "$GITHUB_ENV"
+
+      - name: Wait until droplet is active
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $DO_TOKEN")
+          status=""
+          for i in $(seq 1 50); do
+            d=$(curl -fsS "${auth[@]}" "$API/droplets/$DROPLET_ID")
+            status=$(echo "$d" | jq -r '.droplet.status')
+            [ "$status" = "active" ] && break
+            sleep 6
+          done
+          [ "$status" = "active" ] || { echo "::error::Droplet not active after 5 minutes (status: $status)"; exit 1; }
+
+          v4=$(echo "$d" | jq '[.droplet.networks.v4[]  | select(.type=="public")] | length')
+          v6=$(echo "$d" | jq '[.droplet.networks.v6[]? | select(.type=="public")] | length')
+          [ "$v4" -ge 1 ] && [ "$v6" -ge 1 ] || { echo "::error::Expected both public IPv4 and IPv6"; exit 1; }
+
+      - name: Attach volume to droplet and wait for action
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $DO_TOKEN")
+
+          echo ">> Attaching volume $VOLUME_ID to droplet $DROPLET_ID in $REGION..."
+          action_resp=$(curl -fsS -X POST "$API/volumes/$VOLUME_ID/actions" "${auth[@]}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\":\"attach\",\"droplet_id\":$DROPLET_ID,\"region\":\"$REGION\"}")
+          action_id=$(echo "$action_resp" | jq -r '.action.id')
+          [ -n "$action_id" ] && [ "$action_id" != "null" ] || {
+            echo "::error::Attach action did not return an id"
+            echo "$action_resp" | jq .
+            exit 1
+          }
+
+          # Poll volume action until completed or errored.
+          status=""
+          for i in $(seq 1 40); do
+            a=$(curl -fsS "${auth[@]}" "$API/volumes/$VOLUME_ID/actions/$action_id")
+            status=$(echo "$a" | jq -r '.action.status')
+            case "$status" in
+              completed) echo ">> Volume attach completed"; break ;;
+              errored|error)
+                echo "::error::Volume attach action failed"
+                echo "$a" | jq .
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+          [ "$status" = "completed" ] || {
+            echo "::error::Volume attach not completed after ~3.5 minutes (status: $status)"
+            exit 1
+          }
+
+          # Confirm the volume now lists this droplet.
+          vol=$(curl -fsS "${auth[@]}" "$API/volumes/$VOLUME_ID")
+          attached=$(echo "$vol" | jq --argjson id "$DROPLET_ID" \
+            '[.volume.droplet_ids[]? | select(. == $id)] | length')
+          [ "$attached" -ge 1 ] || {
+            echo "::error::Volume does not list droplet $DROPLET_ID after attach"
+            exit 1
+          }
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "### mirr-server created"
+            echo "- Droplet ID: \`$DROPLET_ID\`"
+            echo "- Volume: \`$VOLUME_NAME\` (\`$VOLUME_ID\`) attached"
+            echo "- Region / size: \`$REGION\` / \`$SIZE\`"
+            echo "- Read public IPs in the DigitalOcean app (not printed: public logs)."
+            echo "- First boot takes a few minutes; wait for \`/var/lib/cloud/instance/mirr-bootstrap.done\`."
+            echo "- cloud-init will mount the volume at \`/mnt/mirr-volume\` and chown to deploy, or fail visibly."
+          } >> "$GITHUB_STEP_SUMMARY"
