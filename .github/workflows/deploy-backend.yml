@@ -1,7 +1,7 @@
 # Secrets needed:
 # - DROPLET_HOST: IP or hostname of mirr-server droplet
 # - DROPLET_SSH_KEY: Private SSH key for deploy user
-# - PROD_ENV_FILE: (Optional) Raw or Base64 production .env file content
+# - PROD_ENV_FILE: (Optional) Raw or Base64 production .env file content → written to /opt/mir/.env
 # - FRONTEND_REPO_PAT: Personal access token to push to novice-coder-bw/mirr-web
 # - TELEGRAM_BOT_TOKEN: (Optional) Telegram bot token for failure alerts
 # - TELEGRAM_CHAT_ID: (Optional) Telegram chat ID for failure alerts
@@ -28,7 +28,7 @@ on:
         required: false
         type: string
       sync_env:
-        description: "Force sync PROD_ENV_FILE secret to /mnt/mirr-volume/.env"
+        description: "Force sync PROD_ENV_FILE secret to /opt/mir/.env"
         required: false
         type: boolean
         default: false
@@ -108,14 +108,14 @@ jobs:
         run: |
           scp -r deploy/* "deploy@$DROPLET_HOST:/opt/mir/"
 
-      - name: Sync and sanitize production .env to volume
+      - name: Sync and sanitize production .env to /opt/mir/.env
         env:
           PROD_ENV_SECRET: ${{ secrets.PROD_ENV_FILE }}
           SYNC_ENV_INPUT: ${{ inputs.sync_env }}
         run: |
           set -euo pipefail
           if [ -z "${PROD_ENV_SECRET:-}" ]; then
-            echo ">> PROD_ENV_FILE secret not provided; preserving existing environment on Droplet."
+            echo ">> PROD_ENV_FILE secret not provided; preserving existing /opt/mir/.env on Droplet."
             exit 0
           fi
 
@@ -126,10 +126,8 @@ jobs:
           fi
 
           echo ">> Sanitizing .env content (mobile quotes, CRLF, unicode dashes)..."
-          # Check if secret is already base64 encoded, decode first if so; otherwise treat as plaintext
           RAW_CONTENT=""
           if echo "$PROD_ENV_SECRET" | base64 -d >/dev/null 2>&1; then
-            # Verify if decoding actually produces readable text with newline/equal
             DECODED=$(echo "$PROD_ENV_SECRET" | base64 -d 2>/dev/null || true)
             if echo "$DECODED" | grep -q "="; then
               RAW_CONTENT="$DECODED"
@@ -145,26 +143,19 @@ jobs:
             sed -e 's/[“”]/"/g' -e "s/[‘’]/'/g" -e 's/[—–]/-/g' | \
             base64 -w 0)
 
-          echo ">> Injecting sanitized .env atomically to /mnt/mirr-volume/.env via base64..."
+          echo ">> Injecting sanitized .env atomically to /opt/mir/.env via base64..."
           ssh "deploy@$DROPLET_HOST" bash -s -- "$SANITIZED_B64" << 'REMOTE_SCRIPT'
             set -euo pipefail
             B64_DATA="$1"
+            TARGET_DIR="/opt/mir"
 
-            TARGET_DIR="/mnt/mirr-volume"
-            # Support legacy /mnt/mirr_volume if /mnt/mirr-volume does not exist
-            if [ ! -d "$TARGET_DIR" ] && [ -d "/mnt/mirr_volume" ]; then
-              TARGET_DIR="/mnt/mirr_volume"
-            fi
-
-            # Fail-fast check: directory must exist and be writable by deploy user
             if [ ! -d "$TARGET_DIR" ]; then
-              echo "::error::Volume mount directory $TARGET_DIR does not exist on Droplet! Verify block storage volume attachment."
+              echo "::error::$TARGET_DIR does not exist on Droplet (cloud-init incomplete?)."
               exit 1
             fi
 
             if [ ! -w "$TARGET_DIR" ]; then
               echo "::error::Permission denied: deploy user cannot write to $TARGET_DIR."
-              echo "::error::Fix on Droplet: sudo chown -R deploy:deploy $TARGET_DIR && sudo chmod 750 $TARGET_DIR"
               exit 1
             fi
 
@@ -172,7 +163,6 @@ jobs:
             echo "$B64_DATA" | base64 -d > "$TMP_FILE"
             chmod 600 "$TMP_FILE"
 
-            # Validate that DOMAIN exists before replacing
             if ! grep -E '^[[:space:]]*DOMAIN[[:space:]]*=' "$TMP_FILE" >/dev/null 2>&1; then
               echo "::error::Sanity check failed: DOMAIN key missing in generated .env"
               rm -f "$TMP_FILE"
@@ -181,13 +171,6 @@ jobs:
 
             mv "$TMP_FILE" "${TARGET_DIR}/.env"
             echo ">> Successfully updated ${TARGET_DIR}/.env"
-
-            # If alternate directory exists, keep symlinked for consistency
-            if [ "$TARGET_DIR" = "/mnt/mirr-volume" ] && [ ! -e "/mnt/mirr_volume" ]; then
-              ln -sfn /mnt/mirr-volume /mnt/mirr_volume 2>/dev/null || true
-            elif [ "$TARGET_DIR" = "/mnt/mirr_volume" ] && [ ! -e "/mnt/mirr-volume" ]; then
-              ln -sfn /mnt/mirr_volume /mnt/mirr-volume 2>/dev/null || true
-            fi
           REMOTE_SCRIPT
 
       - name: Validate tag and run release script on Droplet
@@ -250,7 +233,6 @@ jobs:
             git push -f origin api-contract
             echo "Pushed updated OpenAPI contract to novice-coder-bw/mirr-web branch api-contract."
 
-            # Open PR via GitHub REST API if not already open
             curl -fsS -X POST \
               -H "Authorization: Bearer ${FRONTEND_PAT}" \
               -H "Accept: application/vnd.github+json" \

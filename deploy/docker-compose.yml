@@ -18,7 +18,7 @@ services:
     image: ghcr.io/novice-coder-bw/mir-api:${TAG}
     restart: unless-stopped
     env_file:
-      - /mnt/mirr-volume/.env
+      - /opt/mir/.env
     environment:
       - REDIS_URL=redis://redis:6379/0
     depends_on:
@@ -28,7 +28,7 @@ services:
     image: ghcr.io/novice-coder-bw/mir-worker:${TAG}
     restart: unless-stopped
     env_file:
-      - /mnt/mirr-volume/.env
+      - /opt/mir/.env
     environment:
       - REDIS_URL=redis://redis:6379/0
       - SCRATCH_DIR=/scratch
