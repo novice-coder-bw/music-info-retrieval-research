@@ -3,10 +3,13 @@ name: provision-droplet
 # Creates the mirr-server Droplet through the DigitalOcean API.
 # Run it from github.com (Actions tab > provision-droplet > Run workflow).
 # Needs a repo/environment secret: DIGITALOCEAN_TOKEN (custom-scope token:
-# Droplet create/read, SSH key read, plus whatever the sizes endpoint requires).
+# Droplet create/read, volume read/create, volume actions attach, SSH key read).
 #
 # NOTE: this repo is public, so Actions logs are public. This workflow never
 # prints IP addresses or the token. Read the IPs in the DigitalOcean app.
+#
+# Volume attach is a separate API step after droplet create. The REST create
+# endpoint does not reliably attach an existing volume by ID (unlike the UI).
 
 on:
   workflow_dispatch:
@@ -34,7 +37,7 @@ concurrency: provision-droplet
 jobs:
   create:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     environment: production   # required reviewer = you, approve from the GitHub app
     env:
       DO_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
@@ -43,6 +46,7 @@ jobs:
       REGION: ${{ inputs.region }}
       SIZE: ${{ inputs.size }}
       KEY_NAMES: ${{ inputs.ssh_key_names }}
+      VOLUME_NAME: mirr-volume
     steps:
       - uses: actions/checkout@v4
 
@@ -90,79 +94,15 @@ jobs:
           set -euo pipefail
           auth=(-H "Authorization: Bearer $DO_TOKEN")
 
-          echo ">> Checking if volume 'mirr-volume' exists in region $REGION..."
-          vols=$(curl -fsS "${auth[@]}" "$API/volumes?name=mirr-volume&region=$REGION")
+          echo ">> Checking if volume '$VOLUME_NAME' exists in region $REGION..."
+          vols=$(curl -fsS "${auth[@]}" "$API/volumes?name=$VOLUME_NAME&region=$REGION")
           vol_id=$(echo "$vols" | jq -r '.volumes[0].id // empty')
+          droplet_ids=$(echo "$vols" | jq -c '.volumes[0].droplet_ids // []')
 
           if [ -z "$vol_id" ]; then
-            echo ">> Volume 'mirr-volume' not found. Creating 1GB ext4 volume in $REGION..."
+            echo ">> Volume '$VOLUME_NAME' not found. Creating 1GB ext4 volume in $REGION..."
             create_resp=$(curl -fsS -X POST "$API/volumes" "${auth[@]}" \
               -H "Content-Type: application/json" \
               -d '{
                 "size_gigabytes": 1,
-                "name": "mirr-volume",
-                "description": "Persistent storage volume for mirr production .env",
-                "region": "'"$REGION"'",
-                "filesystem_type": "ext4",
-                "filesystem_label": "mirr-volume"
-              }')
-            vol_id=$(echo "$create_resp" | jq -r '.volume.id')
-            echo ">> Created volume mirr-volume (ID: $vol_id)"
-          else
-            echo ">> Found existing volume mirr-volume (ID: $vol_id)"
-          fi
-          echo "VOLUME_ID=$vol_id" >> "$GITHUB_ENV"
-
-      - name: Create droplet
-        run: |
-          set -euo pipefail
-          auth=(-H "Authorization: Bearer $DO_TOKEN")
-
-          jq -n \
-            --rawfile ud deploy/cloud-init.yaml \
-            --argjson keys "$FPS" \
-            --arg vol "$VOLUME_ID" \
-            --arg name "$NAME" --arg region "$REGION" --arg size "$SIZE" '
-            {
-              name: $name,
-              region: $region,
-              size: $size,
-              image: "ubuntu-24-04-x64",
-              ssh_keys: $keys,
-              volumes: [$vol],
-              ipv6: true,
-              monitoring: true,
-              backups: false,
-              tags: ["mirr", "prod"],
-              user_data: $ud
-            }' > body.json
-
-          resp=$(curl -fsS -X POST "$API/droplets" "${auth[@]}" \
-            -H "Content-Type: application/json" -d @body.json)
-          echo "DROPLET_ID=$(echo "$resp" | jq -r '.droplet.id')" >> "$GITHUB_ENV"
-
-      - name: Wait until active and verify networking
-        run: |
-          set -euo pipefail
-          auth=(-H "Authorization: Bearer $DO_TOKEN")
-          status=""
-          for i in $(seq 1 50); do
-            d=$(curl -fsS "${auth[@]}" "$API/droplets/$DROPLET_ID")
-            status=$(echo "$d" | jq -r '.droplet.status')
-            [ "$status" = "active" ] && break
-            sleep 6
-          done
-          [ "$status" = "active" ] || { echo "::error::Droplet not active after 5 minutes (status: $status)"; exit 1; }
-
-          v4=$(echo "$d" | jq '[.droplet.networks.v4[]  | select(.type=="public")] | length')
-          v6=$(echo "$d" | jq '[.droplet.networks.v6[]? | select(.type=="public")] | length')
-          {
-            echo "### mirr-server created"
-            echo "- Droplet ID: \`$DROPLET_ID\`"
-            echo "- Region / size: \`$REGION\` / \`$SIZE\`"
-            echo "- Public IPv4 addresses: $v4"
-            echo "- Public IPv6 addresses: $v6"
-            echo "- Read the addresses in the DigitalOcean app (not printed: public logs)."
-            echo "- First boot takes a few minutes; wait for \`/var/lib/cloud/instance/mirr-bootstrap.done\`."
-          } >> "$GITHUB_STEP_SUMMARY"
-          [ "$v4" -ge 1 ] && [ "$v6" -ge 1 ] || { echo "::error::Expected both public IPv4 and IPv6"; exit 1; }
+                "name": "'
