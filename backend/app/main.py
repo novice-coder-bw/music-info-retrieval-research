@@ -286,38 +286,42 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
             detail='Upload intent has already been completed.',
         )
 
-    artifact_url = storage.get_public_url(req.object_key)
-    now_iso = _utcnow_iso()
-    session_data = {
-        'file_id': req.file_id,
-        'user_id': user_id,
-        'filename': req.filename,
-        'content_type': object_type,
-        'size': object_size,
-        'artifact_url': artifact_url,
-        'analysis': {'status': 'pending'},
-        'stems': {'status': 'pending'},
-        'workflow_stages': [
-            {'stage': 'upload', 'status': 'completed', 'message': 'File uploaded directly to storage.'},
-            {'stage': 'analysis', 'status': 'pending', 'message': 'Enqueued for analysis.'},
-        ],
-        'created_at': now_iso,
-    }
-    db_store.save_session(session_data)
-    db_store.save_artifact({
-        'file_id': req.file_id,
-        'name': req.filename,
-        'url': artifact_url,
-        'kind': 'source_audio',
-        'storage_backend': 'r2',
-        'key': req.object_key,
-        'size': object_size,
-        'format': Path(req.filename).suffix.lstrip('.') or 'wav',
-        'mime_type': object_type,
-    })
+    try:
+        artifact_url = storage.get_public_url(req.object_key)
+        now_iso = _utcnow_iso()
+        session_data = {
+            'file_id': req.file_id,
+            'user_id': user_id,
+            'filename': req.filename,
+            'content_type': object_type,
+            'size': object_size,
+            'artifact_url': artifact_url,
+            'analysis': {'status': 'pending'},
+            'stems': {'status': 'pending'},
+            'workflow_stages': [
+                {'stage': 'upload', 'status': 'completed', 'message': 'File uploaded directly to storage.'},
+                {'stage': 'analysis', 'status': 'pending', 'message': 'Enqueued for analysis.'},
+            ],
+            'created_at': now_iso,
+        }
+        db_store.save_session(session_data)
+        db_store.save_artifact({
+            'file_id': req.file_id,
+            'name': req.filename,
+            'url': artifact_url,
+            'kind': 'source_audio',
+            'storage_backend': 'r2',
+            'key': req.object_key,
+            'size': object_size,
+            'format': Path(req.filename).suffix.lstrip('.') or 'wav',
+            'mime_type': object_type,
+        })
 
-    # Enqueue analysis task passing the object_key directly
-    analyze_audio_task.delay(req.file_id, req.object_key)
+        # Enqueue analysis task passing the object_key directly
+        analyze_audio_task.delay(req.file_id, req.object_key)
+    except Exception:
+        db_store.reopen_upload_intent(req.object_key)
+        raise
 
     return CompleteUploadResponse(file_id=req.file_id, status='enqueued', artifact_url=artifact_url)
 

@@ -506,3 +506,22 @@ def test_invalid_token_error_does_not_leak_exception_text(real_auth):
     res = client.get('/api/v1/session/some-id', headers={'Authorization': 'Bearer not-a-jwt'})
     assert res.status_code == 401
     assert res.json() == {'detail': 'Invalid authentication token'}
+
+
+def test_complete_upload_reopens_intent_when_session_write_fails(monkeypatch, setup_mock_s3):
+    from backend.app import main
+
+    file_id, object_key = _presign_and_put(setup_mock_s3)
+    payload = {'file_id': file_id, 'object_key': object_key, 'filename': 'test.wav', 'content_type': 'audio/wav', 'size_bytes': 8}
+
+    def fail(_artifact):
+        raise RuntimeError('db down')
+
+    with monkeypatch.context() as m:
+        m.setattr(main.db_store, 'save_artifact', fail)
+        with pytest.raises(RuntimeError):
+            client.post('/api/v1/uploads/complete', json=payload)
+    assert db_store.get_upload_intent(object_key)['completed'] is False
+
+    assert client.post('/api/v1/uploads/complete', json=payload).status_code == 200
+    assert db_store.get_upload_intent(object_key)['completed'] is True

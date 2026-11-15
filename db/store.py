@@ -123,6 +123,14 @@ def mark_upload_intent_completed(object_key: str, session_factory: Optional[sess
         return result.rowcount == 1
 
 
+def reopen_upload_intent(object_key: str, session_factory: Optional[sessionmaker] = None) -> None:
+    """Undo ``mark_upload_intent_completed`` so a failed completion can be retried."""
+    factory = session_factory or get_session_factory()
+    with factory() as db:
+        db.execute(update(UploadIntentRecord).where(UploadIntentRecord.object_key == object_key).values(completed=False))
+        db.commit()
+
+
 def list_artifacts(file_id: str, session_factory: Optional[sessionmaker] = None) -> list[dict]:
     """Return all stored artifact rows for a session, oldest first."""
     factory = session_factory or get_session_factory()
