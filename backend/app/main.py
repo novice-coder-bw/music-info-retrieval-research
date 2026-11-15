@@ -304,7 +304,9 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
             ],
             'created_at': now_iso,
         }
-        db_store.save_session(session_data)
+        # A session left by an earlier failed attempt may already hold stage results; keep them.
+        if db_store.get_session(req.file_id) is None:
+            db_store.save_session(session_data)
         db_store.save_artifact({
             'file_id': req.file_id,
             'name': req.filename,

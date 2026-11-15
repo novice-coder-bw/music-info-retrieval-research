@@ -523,5 +523,7 @@ def test_complete_upload_reopens_intent_when_session_write_fails(monkeypatch, se
             client.post('/api/v1/uploads/complete', json=payload)
     assert db_store.get_upload_intent(object_key)['completed'] is False
 
+    db_store.save_session({'file_id': file_id, 'stems': {'status': 'completed'}})
     assert client.post('/api/v1/uploads/complete', json=payload).status_code == 200
     assert db_store.get_upload_intent(object_key)['completed'] is True
+    assert db_store.get_session(file_id)['stems'] == {'status': 'completed'}
