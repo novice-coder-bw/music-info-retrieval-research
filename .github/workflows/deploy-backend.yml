@@ -229,7 +229,7 @@ jobs:
           if git status --porcelain | grep -q "openapi.json"; then
             git checkout -B api-contract
             git add src/api/openapi.json
-            git commit -m "chore(api): sync openapi.json contract from backend [skip ci]"
+            git commit -m "chore(api): sync openapi.json contract from backend"
             git push -f origin api-contract
             echo "Pushed updated OpenAPI contract to novice-coder-bw/mirr-web branch api-contract."
 

@@ -24,9 +24,12 @@ from shared.schemas import (  # noqa: E402
     AnalyzeErrorResponse,
     AnalyzeRequest,
     AnalyzeResponse,
+    CompleteUploadResponse,
+    HTTPErrorResponse,
     SeparateErrorResponse,
     SeparateRequest,
     SeparateResponse,
+    SessionResponse,
     StemsMetadata,
     UploadErrorResponse,
     UploadResponse,
@@ -40,6 +43,7 @@ app = FastAPI(
     title='Music Analysis Platform API',
     description='API for stem separation and audio feature analysis',
     version='1.0.0',
+    swagger_ui_oauth2_redirect_url=None,
 )
 
 # CORS setup
@@ -78,6 +82,31 @@ class CompleteUploadRequest(BaseModel):
     filename: str
     content_type: str
     size_bytes: int
+
+
+_ERROR_DESCRIPTIONS = {
+    400: 'Bad request (including unsupported audio content type; allowed: audio/wav, audio/mpeg)',
+    401: 'Missing or invalid Supabase JWT',
+    403: 'Caller does not own this resource',
+    404: 'Resource not found',
+    409: 'Upload intent already completed',
+    413: 'Payload exceeds MAX_UPLOAD_MB',
+}
+
+
+def _error_responses(*codes: int, **models: type[BaseModel]) -> dict:
+    """OpenAPI `responses` for the given status codes.
+
+    Bodies default to `HTTPErrorResponse`; pass `e404=Model` to override one code.
+    422 (request validation) is added by FastAPI automatically.
+    """
+    return {
+        code: {
+            'model': models.get(f'e{code}', HTTPErrorResponse),
+            'description': _ERROR_DESCRIPTIONS[code],
+        }
+        for code in codes
+    }
 
 
 def _utcnow_iso() -> str:
@@ -146,6 +175,8 @@ def health(response: Response):
 @app.post(
     '/api/v1/uploads/presign',
     response_model=PresignUploadResponse,
+    responses=_error_responses(400, 401, 413),
+    operation_id='presign_upload_api_v1_uploads_presign_post',
     tags=['Uploads'],
 )
 def presign_upload(req: PresignUploadRequest, user_id: str = Depends(get_current_user_id)):
@@ -191,6 +222,9 @@ def presign_upload(req: PresignUploadRequest, user_id: str = Depends(get_current
 
 @app.post(
     '/api/v1/uploads/complete',
+    response_model=CompleteUploadResponse,
+    responses=_error_responses(400, 401, 403, 404, 409, 413),
+    operation_id='complete_upload_api_v1_uploads_complete_post',
     tags=['Uploads'],
 )
 def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_current_user_id)):
@@ -273,20 +307,21 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
     # Enqueue analysis task passing the object_key directly
     analyze_audio_task.delay(req.file_id, req.object_key)
 
-    return {'file_id': req.file_id, 'status': 'enqueued', 'artifact_url': artifact_url}
+    return CompleteUploadResponse(file_id=req.file_id, status='enqueued', artifact_url=artifact_url)
 
 
 # --- Multipart Upload (v1 & legacy alias) ---
 @app.post(
     '/api/v1/upload',
     response_model=UploadResponse,
-    responses={400: {'model': UploadErrorResponse}},
+    responses=_error_responses(400, 401, 413, e400=UploadErrorResponse),
+    operation_id='upload_file_api_v1_upload_post',
     tags=['Uploads'],
 )
 @app.post(
     '/api/upload',
     response_model=UploadResponse,
-    responses={400: {'model': UploadErrorResponse}},
+    responses=_error_responses(400, 401, 413, e400=UploadErrorResponse),
     deprecated=True,
     tags=['Legacy Aliases'],
 )
@@ -376,8 +411,20 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(get_c
 
 
 # --- Session Details (v1 & legacy alias) ---
-@app.get('/api/v1/session/{file_id}', tags=['Sessions'])
-@app.get('/api/session/{file_id}', deprecated=True, tags=['Legacy Aliases'])
+@app.get(
+    '/api/v1/session/{file_id}',
+    response_model=SessionResponse,
+    responses=_error_responses(401, 403, 404),
+    operation_id='get_session_api_v1_session__file_id__get',
+    tags=['Sessions'],
+)
+@app.get(
+    '/api/session/{file_id}',
+    response_model=SessionResponse,
+    responses=_error_responses(401, 403, 404),
+    deprecated=True,
+    tags=['Legacy Aliases'],
+)
 def get_session(file_id: str, user_id: str = Depends(get_current_user_id)):
     """Fetch session details. Users can only access sessions they own."""
     session = db_store.get_session(file_id)
@@ -392,12 +439,14 @@ def get_session(file_id: str, user_id: str = Depends(get_current_user_id)):
 @app.post(
     '/api/v1/analyze',
     response_model=AnalyzeResponse,
-    responses={400: {'model': AnalyzeErrorResponse}, 404: {'model': AnalyzeErrorResponse}, 422: {'model': AnalyzeErrorResponse}},
+    responses=_error_responses(400, 401, 403, 404, e400=AnalyzeErrorResponse, e404=AnalyzeErrorResponse),
+    operation_id='analyze_api_v1_analyze_post',
     tags=['Analysis'],
 )
 @app.post(
     '/api/analyze',
     response_model=AnalyzeResponse,
+    responses=_error_responses(400, 401, 403, 404, e400=AnalyzeErrorResponse, e404=AnalyzeErrorResponse),
     deprecated=True,
     tags=['Legacy Aliases'],
 )
@@ -429,15 +478,34 @@ def analyze(req: AnalyzeRequest, user_id: str = Depends(get_current_user_id)):
 
 
 # --- Separate Stems (v1 & legacy alias) ---
+_SEPARATE_RESPONSES = {
+    **_error_responses(400, 401, 403, 404, e400=SeparateErrorResponse, e404=SeparateErrorResponse),
+    422: {
+        'description': 'Request validation error, or the session has no source audio artifact',
+        'content': {
+            'application/json': {
+                'schema': {
+                    'anyOf': [
+                        {'$ref': '#/components/schemas/SeparateErrorResponse'},
+                        {'$ref': '#/components/schemas/HTTPValidationError'},
+                    ],
+                },
+            },
+        },
+    },
+}
+
 @app.post(
     '/api/v1/separate',
     response_model=SeparateResponse,
-    responses={400: {'model': SeparateErrorResponse}, 404: {'model': SeparateErrorResponse}, 422: {'model': SeparateErrorResponse}},
+    responses=_SEPARATE_RESPONSES,
+    operation_id='separate_api_v1_separate_post',
     tags=['Separation'],
 )
 @app.post(
     '/api/separate',
     response_model=SeparateResponse,
+    responses=_SEPARATE_RESPONSES,
     deprecated=True,
     tags=['Legacy Aliases'],
 )

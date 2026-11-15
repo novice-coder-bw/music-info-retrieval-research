@@ -1,11 +1,33 @@
+from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+
+
+class StageStatus(str, Enum):
+    """Status of a workflow stage, analysis or stem separation.
+
+    - `pending`: queued, not started
+    - `active`: running
+    - `completed`: finished successfully
+    - `failed`: finished with an error; see `message` / `next_action`
+    """
+
+    pending = 'pending'
+    active = 'active'
+    completed = 'completed'
+    failed = 'failed'
+
+
+class HTTPErrorResponse(BaseModel):
+    """Error body returned by `HTTPException` (400, 401, 403, 404, 409, 413)."""
+
+    detail: str
 
 
 class WorkflowStageStatus(BaseModel):
     stage: str
-    status: Literal['pending', 'active', 'completed', 'failed']
+    status: StageStatus
     message: str | None = None
     next_action: str | None = None
 
@@ -36,7 +58,7 @@ class AnalyzeRequest(BaseModel):
 
 
 class AnalysisMetadata(BaseModel):
-    status: Literal['pending', 'active', 'completed', 'failed']
+    status: StageStatus
     bpm: float | None = None
     key: str | None = None
     structure: list[str] | None = None
@@ -72,7 +94,7 @@ class StemArtifact(BaseModel):
 
 
 class StemsMetadata(BaseModel):
-    status: Literal['pending', 'active', 'completed', 'failed']
+    status: StageStatus
     stems: list[StemArtifact] | None = None
     task_id: str | None = None
     method: str | None = None
@@ -98,3 +120,50 @@ class SeparateErrorResponse(BaseModel):
     stage: str | None = None
     next_action: str | None = None
     workflow_stages: list[WorkflowStageStatus] | None = None
+
+
+class CompleteUploadResponse(BaseModel):
+    file_id: str
+    status: Literal['enqueued']
+    artifact_url: str
+
+
+class SessionStemArtifact(StemArtifact):
+    """Stem entry as stored on the session; unknown keys are passed through."""
+
+    model_config = ConfigDict(extra='allow')
+
+    filename: str | None = None
+    storage_backend: str | None = None
+    key: str | None = None
+
+
+class SessionAnalysis(AnalysisMetadata):
+    """Analysis result as stored on the session; unknown keys are passed through."""
+
+    model_config = ConfigDict(extra='allow')
+
+    file_id: str | None = None
+
+
+class SessionStems(StemsMetadata):
+    """Stem separation result as stored on the session; unknown keys are passed through."""
+
+    model_config = ConfigDict(extra='allow')
+
+    file_id: str | None = None
+    stems: list[SessionStemArtifact] | None = None
+
+
+class SessionResponse(BaseModel):
+    file_id: str
+    user_id: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
+    size: int | None = None
+    artifact_url: str | None = None
+    analysis: SessionAnalysis | None = None
+    stems: SessionStems | None = None
+    workflow_stages: list[WorkflowStageStatus] | None = None
+    created_at: str | None = None
+    updated_at: str | None = None

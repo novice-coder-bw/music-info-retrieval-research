@@ -129,3 +129,38 @@ ALLOW_PLACEHOLDER_STEMS=0
 ```
 
 **Quote values that contain shell metacharacters.** Single-quote `CORS_ORIGIN_REGEX` on the Droplet file if you edit it by hand.
+
+---
+
+## 8. Frontend origins
+
+The frontend (`novice-coder-bw/mirr-web`, TanStack Start on Cloudflare Workers) calls the API from these origins:
+
+| Origin | Pattern |
+| --- | --- |
+| Production | `https://mirr-web.novice-coder.workers.dev` |
+| Preview deployments | `https://<prefix>-mirr-web.novice-coder.workers.dev` (one `<prefix>` per preview, e.g. a version or branch alias) |
+
+Two independent CORS settings must allow them. Update both when an origin is added.
+
+### API: `CORS_ORIGIN_REGEX`
+
+`backend/app/main.py` passes `CORS_ORIGIN_REGEX` to FastAPI's `CORSMiddleware` (`allow_origin_regex`); the browser `Origin` must fully match it. When the variable is unset, the code default only allows Lovable and `pages.dev` origins, so the Workers frontend is blocked.
+
+Set it in `/opt/mir/.env` (or the `PROD_ENV_FILE` secret), **single-quoted**, so `docker compose --env-file` and any shell keep `\`, `|`, `(` and `$` literally instead of interpolating or escaping them:
+
+```env
+CORS_ORIGIN_REGEX='^https://(([a-z0-9-]+-)?mirr-web\.novice-coder\.workers\.dev|(.*\.)?(lovable\.app|lovableproject\.com|pages\.dev))$'
+```
+
+This allows the production origin, every `<prefix>-mirr-web` preview and the existing Lovable/`pages.dev` origins, and nothing else on `novice-coder.workers.dev`. Restart the API after editing (`docker compose --env-file /opt/mir/.env up -d api`, or redeploy). Check from a phone or laptop:
+
+```bash
+curl -s -o /dev/null -D - -X OPTIONS "https://$DOMAIN/api/v1/uploads/presign" \
+  -H 'Origin: https://mirr-web.novice-coder.workers.dev' \
+  -H 'Access-Control-Request-Method: POST' | grep -i access-control-allow-origin
+```
+
+### R2 bucket CORS
+
+Browsers upload to and play from R2 through presigned URLs, so the bucket's own CORS policy must also list the frontend origins. The policy and the steps to apply it are in [`docs/R2_CORS.md`](R2_CORS.md): it includes `https://mirr-web.novice-coder.workers.dev` and `https://*-mirr-web.novice-coder.workers.dev`. Apply changes in the Cloudflare dashboard (R2 → bucket → Settings → CORS Policy); nothing in this repo deploys it.

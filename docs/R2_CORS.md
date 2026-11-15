@@ -9,6 +9,8 @@ To allow direct browser uploads via presigned URLs and playback from Lovable / w
       "https://*.lovable.app",
       "https://*.lovableproject.com",
       "https://*.pages.dev",
+      "https://mirr-web.novice-coder.workers.dev",
+      "https://*-mirr-web.novice-coder.workers.dev",
       "http://localhost:3000"
     ],
     "AllowedMethods": [
@@ -28,3 +30,5 @@ To allow direct browser uploads via presigned URLs and playback from Lovable / w
   }
 ]
 ```
+
+`https://mirr-web.novice-coder.workers.dev` is the production frontend and `https://*-mirr-web.novice-coder.workers.dev` covers its preview deployments (see "Frontend origins" in `docs/RUNBOOK.md`). Cloudflare's R2 CORS documentation only shows exact origins; if a wildcard origin is not honoured, add each preview origin explicitly.

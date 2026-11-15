@@ -1,5 +1,8 @@
 import os
+import re
+
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from moto import mock_aws
 
@@ -18,6 +21,7 @@ from backend.app.auth import get_current_user_id
 import db.engine as db_engine
 from db import store as db_store
 import services.storage as storage_module
+from shared.schemas import StageStatus
 
 # Override user_id for test suite
 TEST_USER_ID = 'test-user-1234'
@@ -237,3 +241,178 @@ def test_ssl_default_local_vs_remote():
     e_remote = create_engine_for_url('postgresql+psycopg://u:p@aws-0-eu-west-3.pooler.supabase.com:5432/postgres')
     cparams_remote = inspect.getclosurevars(e_remote.pool._creator).nonlocals['cparams']
     assert cparams_remote['sslmode'] == 'require'
+
+
+PUBLIC_API_PATHS = {'/health'}
+PUBLIC_DOC_PATHS = {'/docs', '/redoc', '/openapi.json'}
+WAV_BYTES = b'RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00D\xac\x00\x00\x88X\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00'
+
+
+def _depends_on(dependant, call) -> bool:
+    return any(dep.call is call or _depends_on(dep, call) for dep in dependant.dependencies)
+
+
+def _api_routes() -> list[APIRoute]:
+    return [route for route in app.routes if isinstance(route, APIRoute)]
+
+
+PROTECTED_ROUTES = [
+    (method, route.path)
+    for route in _api_routes()
+    if route.path not in PUBLIC_API_PATHS
+    for method in sorted(route.methods)
+]
+V1_ROUTES = [route for route in _api_routes() if route.path.startswith('/api/v1/')]
+
+
+@pytest.fixture
+def real_auth():
+    """Run the real get_current_user_id instead of the suite-wide override."""
+    override = app.dependency_overrides.pop(get_current_user_id)
+    try:
+        yield
+    finally:
+        app.dependency_overrides[get_current_user_id] = override
+
+
+@pytest.fixture
+def as_user():
+    def _set(user_id):
+        app.dependency_overrides[get_current_user_id] = lambda: user_id
+    yield _set
+    app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
+
+
+def test_only_allowlisted_routes_are_public():
+    public_api = {route.path for route in _api_routes() if not _depends_on(route.dependant, get_current_user_id)}
+    assert public_api == PUBLIC_API_PATHS
+    other_paths = {route.path for route in app.routes if not isinstance(route, APIRoute)}
+    assert other_paths == PUBLIC_DOC_PATHS
+
+
+def test_legacy_aliases_are_registered_and_protected():
+    legacy = {route.path for route in _api_routes() if route.path.startswith('/api/') and not route.path.startswith('/api/v1/')}
+    assert legacy == {'/api/upload', '/api/session/{file_id}', '/api/analyze', '/api/separate'}
+    assert {p for _, p in PROTECTED_ROUTES} >= legacy
+
+
+@pytest.mark.parametrize(('method', 'path'), PROTECTED_ROUTES)
+@pytest.mark.parametrize('headers', [{}, {'Authorization': 'Bearer not-a-jwt'}], ids=['no-token', 'bad-token'])
+def test_protected_routes_reject_missing_or_invalid_token(real_auth, method, path, headers):
+    url = re.sub(r'\{[^}]+\}', 'some-id', path)
+    res = client.request(method, url, headers=headers)
+    assert res.status_code == 401
+    assert res.headers.get('www-authenticate') == 'Bearer'
+
+
+@pytest.mark.parametrize('path', sorted(PUBLIC_DOC_PATHS))
+def test_docs_are_public(real_auth, path):
+    assert client.get(path).status_code == 200
+
+
+def test_oauth2_redirect_route_is_disabled():
+    assert client.get('/docs/oauth2-redirect').status_code == 404
+
+
+@pytest.mark.parametrize('prefix', ['/api/v1', '/api'])
+@pytest.mark.parametrize(('method', 'path_template'), [
+    ('GET', '{prefix}/session/{file_id}'),
+    ('POST', '{prefix}/analyze'),
+    ('POST', '{prefix}/separate'),
+])
+def test_session_routes_enforce_ownership(prefix, method, path_template):
+    file_id = f'owned-by-other{prefix.replace("/", "-")}'
+    db_store.save_session({
+        'file_id': file_id,
+        'user_id': 'someone-else',
+        'filename': 'other.wav',
+        'artifact_url': 'https://pub-fake.r2.dev/uploads/x/other.wav',
+    })
+    path = path_template.format(prefix=prefix, file_id=file_id)
+    res = client.request(method, path, json={'file_id': file_id} if method == 'POST' else None)
+    assert res.status_code == 403
+
+
+@pytest.mark.parametrize('prefix', ['/api/v1', '/api'])
+def test_upload_binds_session_to_caller(prefix, as_user):
+    res = client.post(f'{prefix}/upload', files={'file': ('sample.wav', WAV_BYTES, 'audio/wav')})
+    assert res.status_code == 200
+    file_id = res.json()['file_id']
+    assert db_store.get_session(file_id)['user_id'] == TEST_USER_ID
+
+    as_user('intruder')
+    assert client.get(f'{prefix}/session/{file_id}').status_code == 403
+    assert client.post(f'{prefix}/separate', json={'file_id': file_id}).status_code == 403
+
+
+@pytest.mark.parametrize('prefix', ['/api/v1', '/api'])
+def test_upload_rejects_unsupported_type_with_400(prefix):
+    res = client.post(f'{prefix}/upload', files={'file': ('notes.txt', b'hello', 'text/plain')})
+    assert res.status_code == 400
+    assert res.json()['error_code'] == 'upload_invalid_type'
+
+
+def test_v1_routes_have_stable_operation_ids_and_response_models():
+    operation_ids = [route.operation_id for route in V1_ROUTES]
+    # Pinned to the names FastAPI generated before they were explicit, so generated clients keep working.
+    assert sorted(operation_ids) == sorted([
+        'presign_upload_api_v1_uploads_presign_post',
+        'complete_upload_api_v1_uploads_complete_post',
+        'upload_file_api_v1_upload_post',
+        'get_session_api_v1_session__file_id__get',
+        'analyze_api_v1_analyze_post',
+        'separate_api_v1_separate_post',
+    ])
+    assert all(route.response_model is not None for route in V1_ROUTES)
+    assert 'Body_upload_file_api_v1_upload_post' in client.get('/openapi.json').json()['components']['schemas']
+
+
+def test_v1_routes_document_error_responses():
+    spec = client.get('/openapi.json').json()
+    expected = {
+        ('post', '/api/v1/uploads/presign'): {'400', '401', '413', '422'},
+        ('post', '/api/v1/uploads/complete'): {'400', '401', '403', '404', '409', '413', '422'},
+        ('post', '/api/v1/upload'): {'400', '401', '413', '422'},
+        ('get', '/api/v1/session/{file_id}'): {'401', '403', '404', '422'},
+        ('post', '/api/v1/analyze'): {'400', '401', '403', '404', '422'},
+        ('post', '/api/v1/separate'): {'400', '401', '403', '404', '422'},
+    }
+    v1_ops = {(m, p) for p, ops in spec['paths'].items() if p.startswith('/api/v1/') for m in ops}
+    assert v1_ops == set(expected)
+    for (method, path), codes in expected.items():
+        responses = spec['paths'][path][method]['responses']
+        assert set(responses) - {'200'} == codes, path
+        assert all('content' in responses[c] for c in codes), path
+
+
+def test_stage_status_is_documented_enum():
+    schemas = client.get('/openapi.json').json()['components']['schemas']
+    assert schemas['StageStatus']['enum'] == [s.value for s in StageStatus] == ['pending', 'active', 'completed', 'failed']
+    for name in ('WorkflowStageStatus', 'AnalysisMetadata', 'StemsMetadata'):
+        assert schemas[name]['properties']['status'] == {'$ref': '#/components/schemas/StageStatus'}
+
+
+def test_session_response_preserves_stored_fields():
+    file_id = 'session-shape'
+    db_store.save_session({
+        'file_id': file_id,
+        'user_id': TEST_USER_ID,
+        'filename': 'a.wav',
+        'analysis': {'file_id': file_id, 'status': 'completed', 'bpm': 120.0},
+        'stems': {'file_id': file_id, 'status': 'completed', 'stems': [
+            {'name': 'drums', 'filename': 'drums.wav', 'url': 'https://x/drums.wav', 'key': 'stems/s/drums.wav',
+             'storage_backend': 'r2', 'size': 1, 'format': 'wav', 'mime_type': 'audio/wav'},
+        ]},
+        'workflow_stages': [{'stage': 'upload', 'status': 'completed', 'message': 'ok'}],
+    })
+    body = client.get(f'/api/v1/session/{file_id}').json()
+    assert body['analysis'] == {
+        'file_id': file_id, 'status': 'completed', 'bpm': 120.0, 'key': None, 'structure': None, 'duration': None,
+        'waveform_url': None, 'task_id': None, 'message': None, 'next_action': None, 'analyzed_at': None,
+    }
+    assert body['stems']['stems'][0]['key'] == 'stems/s/drums.wav'
+    assert body['stems']['stems'][0]['filename'] == 'drums.wav'
+    assert set(body) == {
+        'file_id', 'user_id', 'filename', 'content_type', 'size', 'artifact_url', 'analysis', 'stems',
+        'workflow_stages', 'created_at', 'updated_at',
+    }
