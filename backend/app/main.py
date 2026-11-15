@@ -85,13 +85,12 @@ class CompleteUploadRequest(BaseModel):
 
 
 _ERROR_DESCRIPTIONS = {
-    400: 'Bad request',
+    400: 'Bad request (including unsupported audio content type; allowed: audio/wav, audio/mpeg)',
     401: 'Missing or invalid Supabase JWT',
     403: 'Caller does not own this resource',
     404: 'Resource not found',
     409: 'Upload intent already completed',
     413: 'Payload exceeds MAX_UPLOAD_MB',
-    415: 'Unsupported audio content type (allowed: audio/wav, audio/mpeg)',
 }
 
 
@@ -176,15 +175,15 @@ def health(response: Response):
 @app.post(
     '/api/v1/uploads/presign',
     response_model=PresignUploadResponse,
-    responses=_error_responses(401, 413, 415),
-    operation_id='presignUpload',
+    responses=_error_responses(400, 401, 413),
+    operation_id='presign_upload_api_v1_uploads_presign_post',
     tags=['Uploads'],
 )
 def presign_upload(req: PresignUploadRequest, user_id: str = Depends(get_current_user_id)):
     """Generate a presigned PUT URL for client-direct upload to Cloudflare R2."""
     if req.content_type not in ALLOWED_MIME_TYPES:
         raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=f'Unsupported content type: {req.content_type}. Allowed: audio/wav, audio/mpeg.',
         )
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
@@ -224,8 +223,8 @@ def presign_upload(req: PresignUploadRequest, user_id: str = Depends(get_current
 @app.post(
     '/api/v1/uploads/complete',
     response_model=CompleteUploadResponse,
-    responses=_error_responses(400, 401, 403, 404, 409, 413, 415),
-    operation_id='completeUpload',
+    responses=_error_responses(400, 401, 403, 404, 409, 413),
+    operation_id='complete_upload_api_v1_uploads_complete_post',
     tags=['Uploads'],
 )
 def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_current_user_id)):
@@ -270,7 +269,7 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f'File size exceeds {MAX_UPLOAD_MB} MB.')
     if object_type not in ALLOWED_MIME_TYPES:
         s3.delete_object(Bucket=settings['bucket'], Key=req.object_key)
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail='Unsupported object content type.')
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unsupported object content type.')
 
     artifact_url = storage.get_public_url(req.object_key)
     now_iso = _utcnow_iso()
@@ -315,14 +314,14 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
 @app.post(
     '/api/v1/upload',
     response_model=UploadResponse,
-    responses=_error_responses(400, 401, 413, 415, e400=UploadErrorResponse, e415=UploadErrorResponse),
-    operation_id='uploadFile',
+    responses=_error_responses(400, 401, 413, e400=UploadErrorResponse),
+    operation_id='upload_file_api_v1_upload_post',
     tags=['Uploads'],
 )
 @app.post(
     '/api/upload',
     response_model=UploadResponse,
-    responses=_error_responses(400, 401, 413, 415, e400=UploadErrorResponse, e415=UploadErrorResponse),
+    responses=_error_responses(400, 401, 413, e400=UploadErrorResponse),
     deprecated=True,
     tags=['Legacy Aliases'],
 )
@@ -341,7 +340,7 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(get_c
     ext = Path(file.filename).suffix.lower()
     if ext not in {'.wav', '.mp3'}:
         return JSONResponse(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            status_code=400,
             content=UploadErrorResponse(
                 error_code='upload_invalid_type',
                 message=f'Unsupported file format: {ext}. Only WAV and MP3 are supported.',
@@ -416,7 +415,7 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(get_c
     '/api/v1/session/{file_id}',
     response_model=SessionResponse,
     responses=_error_responses(401, 403, 404),
-    operation_id='getSession',
+    operation_id='get_session_api_v1_session__file_id__get',
     tags=['Sessions'],
 )
 @app.get(
@@ -441,7 +440,7 @@ def get_session(file_id: str, user_id: str = Depends(get_current_user_id)):
     '/api/v1/analyze',
     response_model=AnalyzeResponse,
     responses=_error_responses(400, 401, 403, 404, e400=AnalyzeErrorResponse, e404=AnalyzeErrorResponse),
-    operation_id='analyzeAudio',
+    operation_id='analyze_api_v1_analyze_post',
     tags=['Analysis'],
 )
 @app.post(
@@ -500,7 +499,7 @@ _SEPARATE_RESPONSES = {
     '/api/v1/separate',
     response_model=SeparateResponse,
     responses=_SEPARATE_RESPONSES,
-    operation_id='separateStems',
+    operation_id='separate_api_v1_separate_post',
     tags=['Separation'],
 )
 @app.post(

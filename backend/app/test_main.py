@@ -91,7 +91,7 @@ def test_presigned_upload_invalid_type():
             'size_bytes': 1024,
         },
     )
-    assert res.status_code == 415
+    assert res.status_code == 400
 
 
 def test_complete_upload_and_session_access():
@@ -127,7 +127,7 @@ def test_complete_upload_and_session_access():
 
 @pytest.mark.parametrize(('content_type', 'max_mb', 'expected_status'), [
     ('audio/wav', 0, 413),
-    ('text/plain', 1, 415),
+    ('text/plain', 1, 400),
 ])
 def test_complete_upload_rejects_and_deletes_invalid_object(monkeypatch, setup_mock_s3, content_type, max_mb, expected_status):
     from backend.app import main
@@ -346,26 +346,33 @@ def test_upload_binds_session_to_caller(prefix, as_user):
 
 
 @pytest.mark.parametrize('prefix', ['/api/v1', '/api'])
-def test_upload_rejects_unsupported_type_with_415(prefix):
+def test_upload_rejects_unsupported_type_with_400(prefix):
     res = client.post(f'{prefix}/upload', files={'file': ('notes.txt', b'hello', 'text/plain')})
-    assert res.status_code == 415
+    assert res.status_code == 400
     assert res.json()['error_code'] == 'upload_invalid_type'
 
 
 def test_v1_routes_have_stable_operation_ids_and_response_models():
     operation_ids = [route.operation_id for route in V1_ROUTES]
+    # Pinned to the names FastAPI generated before they were explicit, so generated clients keep working.
     assert sorted(operation_ids) == sorted([
-        'presignUpload', 'completeUpload', 'uploadFile', 'getSession', 'analyzeAudio', 'separateStems',
+        'presign_upload_api_v1_uploads_presign_post',
+        'complete_upload_api_v1_uploads_complete_post',
+        'upload_file_api_v1_upload_post',
+        'get_session_api_v1_session__file_id__get',
+        'analyze_api_v1_analyze_post',
+        'separate_api_v1_separate_post',
     ])
     assert all(route.response_model is not None for route in V1_ROUTES)
+    assert 'Body_upload_file_api_v1_upload_post' in client.get('/openapi.json').json()['components']['schemas']
 
 
 def test_v1_routes_document_error_responses():
     spec = client.get('/openapi.json').json()
     expected = {
-        ('post', '/api/v1/uploads/presign'): {'401', '413', '415', '422'},
-        ('post', '/api/v1/uploads/complete'): {'400', '401', '403', '404', '409', '413', '415', '422'},
-        ('post', '/api/v1/upload'): {'400', '401', '413', '415', '422'},
+        ('post', '/api/v1/uploads/presign'): {'400', '401', '413', '422'},
+        ('post', '/api/v1/uploads/complete'): {'400', '401', '403', '404', '409', '413', '422'},
+        ('post', '/api/v1/upload'): {'400', '401', '413', '422'},
         ('get', '/api/v1/session/{file_id}'): {'401', '403', '404', '422'},
         ('post', '/api/v1/analyze'): {'400', '401', '403', '404', '422'},
         ('post', '/api/v1/separate'): {'400', '401', '403', '404', '422'},

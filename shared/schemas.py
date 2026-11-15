@@ -20,7 +20,7 @@ class StageStatus(str, Enum):
 
 
 class HTTPErrorResponse(BaseModel):
-    """Error body returned by `HTTPException` (401, 403, 404, 409, 413, 415)."""
+    """Error body returned by `HTTPException` (400, 401, 403, 404, 409, 413)."""
 
     detail: str
 
