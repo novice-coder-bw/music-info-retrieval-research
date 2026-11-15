@@ -305,8 +305,14 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
             'created_at': now_iso,
         }
         # A session left by an earlier failed attempt may already hold stage results; keep them.
-        if db_store.get_session(req.file_id) is None:
+        existing_session = db_store.get_session(req.file_id)
+        if existing_session is None:
             db_store.save_session(session_data)
+        elif not _is_owner(existing_session, user_id):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='A session with this file_id already exists.',
+            )
         db_store.save_artifact({
             'file_id': req.file_id,
             'name': req.filename,

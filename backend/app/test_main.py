@@ -527,3 +527,17 @@ def test_complete_upload_reopens_intent_when_session_write_fails(monkeypatch, se
     assert client.post('/api/v1/uploads/complete', json=payload).status_code == 200
     assert db_store.get_upload_intent(object_key)['completed'] is True
     assert db_store.get_session(file_id)['stems'] == {'status': 'completed'}
+
+
+def test_complete_upload_refuses_existing_session_owned_by_someone_else(setup_mock_s3):
+    file_id, object_key = _presign_and_put(setup_mock_s3)
+    db_store.save_session({'file_id': file_id, 'user_id': 'other-user', 'filename': 'victim.wav'})
+    payload = {'file_id': file_id, 'object_key': object_key, 'filename': 'test.wav', 'content_type': 'audio/wav', 'size_bytes': 8}
+
+    res = client.post('/api/v1/uploads/complete', json=payload)
+
+    assert res.status_code == 409
+    session = db_store.get_session(file_id)
+    assert session['user_id'] == 'other-user'
+    assert session['filename'] == 'victim.wav'
+    assert db_store.list_artifacts(file_id) == []
