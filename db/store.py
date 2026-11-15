@@ -1,4 +1,5 @@
 from typing import Optional
+from sqlalchemy import update
 from sqlalchemy.orm import sessionmaker
 
 from db.engine import get_session_factory
@@ -113,12 +114,13 @@ def mark_upload_intent_completed(object_key: str, session_factory: Optional[sess
     """Mark an upload intent as completed atomically; returns False if not found or already completed."""
     factory = session_factory or get_session_factory()
     with factory() as db:
-        row = db.get(UploadIntentRecord, object_key)
-        if not row or row.completed:
-            return False
-        row.completed = True
+        result = db.execute(
+            update(UploadIntentRecord)
+            .where(UploadIntentRecord.object_key == object_key, UploadIntentRecord.completed.is_(False))
+            .values(completed=True)
+        )
         db.commit()
-        return True
+        return result.rowcount == 1
 
 
 def list_artifacts(file_id: str, session_factory: Optional[sessionmaker] = None) -> list[dict]:

@@ -94,6 +94,12 @@ _ERROR_DESCRIPTIONS = {
 }
 
 
+def _is_owner(record: dict, user_id: str) -> bool:
+    """Fail closed: a record without a user_id is owned by nobody."""
+    owner = record.get('user_id')
+    return bool(owner) and owner == user_id
+
+
 def _error_responses(*codes: int, **models: type[BaseModel]) -> dict:
     """OpenAPI `responses` for the given status codes.
 
@@ -229,24 +235,27 @@ def presign_upload(req: PresignUploadRequest, user_id: str = Depends(get_current
 )
 def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_current_user_id)):
     """Complete direct upload: verify R2 object, create session, enqueue analysis."""
-    # Verify ownership and valid intent
     intent = db_store.get_upload_intent(req.object_key)
-    if intent:
-        if intent['user_id'] != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail='Caller does not own this upload intent.',
-            )
-        if intent.get('completed'):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail='Upload intent has already been completed.',
-            )
-        if intent['file_id'] != req.file_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='file_id mismatch with presigned intent.',
-            )
+    if not intent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='No upload intent for this object_key; call /api/v1/uploads/presign first.',
+        )
+    if not _is_owner(intent, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Caller does not own this upload intent.',
+        )
+    if intent.get('completed'):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Upload intent has already been completed.',
+        )
+    if intent['file_id'] != req.file_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='file_id mismatch with presigned intent.',
+        )
 
     # Verify object exists in R2
     s3 = storage.get_s3_client()
@@ -270,6 +279,12 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
     if object_type not in ALLOWED_MIME_TYPES:
         s3.delete_object(Bucket=settings['bucket'], Key=req.object_key)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unsupported object content type.')
+
+    if not db_store.mark_upload_intent_completed(req.object_key):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Upload intent has already been completed.',
+        )
 
     artifact_url = storage.get_public_url(req.object_key)
     now_iso = _utcnow_iso()
@@ -300,9 +315,6 @@ def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(get_curre
         'format': Path(req.filename).suffix.lstrip('.') or 'wav',
         'mime_type': object_type,
     })
-
-    if intent:
-        db_store.mark_upload_intent_completed(req.object_key)
 
     # Enqueue analysis task passing the object_key directly
     analyze_audio_task.delay(req.file_id, req.object_key)
@@ -430,23 +442,44 @@ def get_session(file_id: str, user_id: str = Depends(get_current_user_id)):
     session = db_store.get_session(file_id)
     if not session:
         raise HTTPException(status_code=404, detail='Session not found')
-    if session.get('user_id') and session.get('user_id') != user_id:
+    if not _is_owner(session, user_id):
         raise HTTPException(status_code=403, detail='Access forbidden: session belongs to another user')
     return session
 
 
+def _missing_artifact_or_validation_error(error_schema: str) -> dict:
+    return {
+        'description': 'Request validation error, or the session has no source audio artifact',
+        'content': {
+            'application/json': {
+                'schema': {
+                    'anyOf': [
+                        {'$ref': f'#/components/schemas/{error_schema}'},
+                        {'$ref': '#/components/schemas/HTTPValidationError'},
+                    ],
+                },
+            },
+        },
+    }
+
+
 # --- Analyze Audio (v1 & legacy alias) ---
+_ANALYZE_RESPONSES = {
+    **_error_responses(400, 401, 403, 404, e400=AnalyzeErrorResponse, e404=AnalyzeErrorResponse),
+    422: _missing_artifact_or_validation_error('AnalyzeErrorResponse'),
+}
+
 @app.post(
     '/api/v1/analyze',
     response_model=AnalyzeResponse,
-    responses=_error_responses(400, 401, 403, 404, e400=AnalyzeErrorResponse, e404=AnalyzeErrorResponse),
+    responses=_ANALYZE_RESPONSES,
     operation_id='analyze_api_v1_analyze_post',
     tags=['Analysis'],
 )
 @app.post(
     '/api/analyze',
     response_model=AnalyzeResponse,
-    responses=_error_responses(400, 401, 403, 404, e400=AnalyzeErrorResponse, e404=AnalyzeErrorResponse),
+    responses=_ANALYZE_RESPONSES,
     deprecated=True,
     tags=['Legacy Aliases'],
 )
@@ -463,10 +496,20 @@ def analyze(req: AnalyzeRequest, user_id: str = Depends(get_current_user_id)):
                 next_action='Upload a file first',
             ).model_dump(),
         )
-    if session.get('user_id') and session.get('user_id') != user_id:
+    if not _is_owner(session, user_id):
         raise HTTPException(status_code=403, detail='Access forbidden')
 
-    artifact_url = session.get('artifact_url') or req.artifact_url
+    artifact_url = session.get('artifact_url')
+    if not artifact_url:
+        return JSONResponse(
+            status_code=422,
+            content=AnalyzeErrorResponse(
+                error_code='analyze_missing_artifact',
+                message='Audio artifact URL missing for session',
+                stage='analysis',
+                next_action='Upload file again',
+            ).model_dump(),
+        )
     analyze_audio_task.delay(req.file_id, artifact_url)
     analysis = session.get('analysis') or {'status': 'pending'}
     stages = [WorkflowStageStatus(**s) for s in (session.get('workflow_stages') or [])]
@@ -480,19 +523,7 @@ def analyze(req: AnalyzeRequest, user_id: str = Depends(get_current_user_id)):
 # --- Separate Stems (v1 & legacy alias) ---
 _SEPARATE_RESPONSES = {
     **_error_responses(400, 401, 403, 404, e400=SeparateErrorResponse, e404=SeparateErrorResponse),
-    422: {
-        'description': 'Request validation error, or the session has no source audio artifact',
-        'content': {
-            'application/json': {
-                'schema': {
-                    'anyOf': [
-                        {'$ref': '#/components/schemas/SeparateErrorResponse'},
-                        {'$ref': '#/components/schemas/HTTPValidationError'},
-                    ],
-                },
-            },
-        },
-    },
+    422: _missing_artifact_or_validation_error('SeparateErrorResponse'),
 }
 
 @app.post(
@@ -522,7 +553,7 @@ def separate(req: SeparateRequest, user_id: str = Depends(get_current_user_id)):
                 next_action='Upload a file first',
             ).model_dump(),
         )
-    if session.get('user_id') and session.get('user_id') != user_id:
+    if not _is_owner(session, user_id):
         raise HTTPException(status_code=403, detail='Access forbidden')
 
     artifact_url = session.get('artifact_url')

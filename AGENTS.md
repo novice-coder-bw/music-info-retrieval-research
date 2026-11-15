@@ -57,7 +57,7 @@ You have no credentials and cannot call Supabase, R2, the Droplet or DigitalOcea
 
 ### Auth and security
 - Every route except `/health` (and FastAPI's `/docs`, `/redoc`, `/openapi.json`) must depend on `get_current_user_id`. No auth bypass flags or debug backdoors. Tests use `app.dependency_overrides`.
-- Check ownership on every session or upload-intent lookup, and **fail closed**: a record with no `user_id` is not owned by the caller. (Current code is fail-open for legacy rows with `user_id` NULL; see "Known limitations" in `README.md`. New code must not copy that pattern.)
+- Check ownership on every session or upload-intent lookup, and **fail closed**: a record with no `user_id` is not owned by the caller. Use `_is_owner` in `backend/app/main.py`.
 - Derive R2 object keys from server-side records (session, upload intent), never from client-supplied URLs or keys. Verify uploaded objects from R2 (`head_object`); never trust client-supplied size or type.
 - Do not log tokens, database URLs or presigned URLs.
 

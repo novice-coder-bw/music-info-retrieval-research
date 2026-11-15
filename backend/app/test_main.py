@@ -94,12 +94,16 @@ def test_presigned_upload_invalid_type():
     assert res.status_code == 400
 
 
-def test_complete_upload_and_session_access():
-    file_id = 'test-file-abc'
-    object_key = f'uploads/{file_id}/test.wav'
-    # Put object in mock S3 first
-    s3 = storage_module.get_s3_client()
-    s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'RIFFdemo', ContentType='audio/wav')
+def _presign_and_put(s3, content_type='audio/wav', body=b'RIFFdemo'):
+    res = client.post('/api/v1/uploads/presign', json={'filename': 'test.wav', 'content_type': 'audio/wav', 'size_bytes': 1024})
+    assert res.status_code == 200
+    data = res.json()
+    s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=data['object_key'], Body=body, ContentType=content_type)
+    return data['file_id'], data['object_key']
+
+
+def test_complete_upload_and_session_access(setup_mock_s3):
+    file_id, object_key = _presign_and_put(setup_mock_s3)
 
     res = client.post(
         '/api/v1/uploads/complete',
@@ -132,28 +136,28 @@ def test_complete_upload_and_session_access():
 def test_complete_upload_rejects_and_deletes_invalid_object(monkeypatch, setup_mock_s3, content_type, max_mb, expected_status):
     from backend.app import main
 
+    file_id, object_key = _presign_and_put(setup_mock_s3, content_type=content_type, body=b'data')
     monkeypatch.setattr(main, 'MAX_UPLOAD_MB', max_mb)
-    object_key = 'uploads/test-invalid/source.wav'
-    setup_mock_s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'data', ContentType=content_type)
     res = client.post('/api/v1/uploads/complete', json={
-        'file_id': 'test-invalid', 'object_key': object_key, 'filename': 'source.wav',
+        'file_id': file_id, 'object_key': object_key, 'filename': 'source.wav',
         'content_type': 'audio/wav', 'size_bytes': 1,
     })
     assert res.status_code == expected_status
     assert setup_mock_s3.list_objects_v2(Bucket=os.environ['R2_BUCKET'], Prefix=object_key).get('KeyCount') == 0
+    assert db_store.get_upload_intent(object_key)['completed'] is False
+    assert db_store.get_session(file_id) is None
 
 
 def test_complete_upload_uses_stored_metadata(monkeypatch, setup_mock_s3):
     from backend.app import main
 
-    object_key = 'uploads/test-metadata/source.wav'
-    setup_mock_s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'data', ContentType='audio/wav')
+    file_id, object_key = _presign_and_put(setup_mock_s3, body=b'data')
     sessions, artifacts, tasks = [], [], []
     monkeypatch.setattr(main.db_store, 'save_session', sessions.append)
     monkeypatch.setattr(main.db_store, 'save_artifact', artifacts.append)
     monkeypatch.setattr(main.analyze_audio_task, 'delay', lambda *args: tasks.append(args))
     res = client.post('/api/v1/uploads/complete', json={
-        'file_id': 'test-metadata', 'object_key': object_key, 'filename': 'source.wav',
+        'file_id': file_id, 'object_key': object_key, 'filename': 'source.wav',
         'content_type': 'audio/mpeg', 'size_bytes': 1,
     })
     assert res.status_code == 200
@@ -416,3 +420,89 @@ def test_session_response_preserves_stored_fields():
         'file_id', 'user_id', 'filename', 'content_type', 'size', 'artifact_url', 'analysis', 'stems',
         'workflow_stages', 'created_at', 'updated_at',
     }
+
+
+def test_complete_upload_requires_intent(setup_mock_s3):
+    # Another user's object that exists in R2 but was never presigned by the caller.
+    object_key = 'uploads/victim-file/source.wav'
+    setup_mock_s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'RIFFdemo', ContentType='audio/wav')
+    db_store.save_session({'file_id': 'victim-file', 'user_id': 'victim', 'filename': 'source.wav'})
+
+    res = client.post('/api/v1/uploads/complete', json={
+        'file_id': 'victim-file', 'object_key': object_key, 'filename': 'source.wav',
+        'content_type': 'audio/wav', 'size_bytes': 8,
+    })
+    assert res.status_code == 404
+    assert db_store.get_session('victim-file')['user_id'] == 'victim'
+    assert setup_mock_s3.list_objects_v2(Bucket=os.environ['R2_BUCKET'], Prefix=object_key).get('KeyCount') == 1
+
+
+def test_mark_upload_intent_completed_only_once(setup_mock_s3):
+    _, object_key = _presign_and_put(setup_mock_s3)
+    assert db_store.mark_upload_intent_completed(object_key) is True
+    assert db_store.mark_upload_intent_completed(object_key) is False
+    assert db_store.mark_upload_intent_completed('uploads/missing/source.wav') is False
+
+
+def test_complete_upload_conflicts_when_intent_claimed_concurrently(monkeypatch, setup_mock_s3):
+    from backend.app import main
+
+    file_id, object_key = _presign_and_put(setup_mock_s3)
+    monkeypatch.setattr(main.db_store, 'mark_upload_intent_completed', lambda key: False)
+    res = client.post('/api/v1/uploads/complete', json={
+        'file_id': file_id, 'object_key': object_key, 'filename': 'test.wav',
+        'content_type': 'audio/wav', 'size_bytes': 8,
+    })
+    assert res.status_code == 409
+    assert db_store.get_session(file_id) is None
+
+
+@pytest.mark.parametrize('prefix', ['/api/v1', '/api'])
+@pytest.mark.parametrize(('method', 'path_template'), [
+    ('GET', '{prefix}/session/{file_id}'),
+    ('POST', '{prefix}/analyze'),
+    ('POST', '{prefix}/separate'),
+])
+def test_unowned_legacy_sessions_fail_closed(prefix, method, path_template):
+    file_id = f'unowned{prefix.replace("/", "-")}'
+    db_store.save_session({
+        'file_id': file_id,
+        'user_id': None,
+        'filename': 'legacy.wav',
+        'artifact_url': 'https://pub-fake.r2.dev/uploads/x/legacy.wav',
+    })
+    path = path_template.format(prefix=prefix, file_id=file_id)
+    res = client.request(method, path, json={'file_id': file_id} if method == 'POST' else None)
+    assert res.status_code == 403
+
+
+@pytest.mark.parametrize('prefix', ['/api/v1', '/api'])
+def test_analyze_ignores_client_artifact_url(monkeypatch, prefix):
+    from backend.app import main
+
+    tasks = []
+    monkeypatch.setattr(main.analyze_audio_task, 'delay', lambda *args: tasks.append(args))
+    stored = 'https://pub-fake.r2.dev/uploads/mine/source.wav'
+    db_store.save_session({'file_id': f'with-artifact{prefix}', 'user_id': TEST_USER_ID, 'artifact_url': stored})
+    db_store.save_session({'file_id': f'no-artifact{prefix}', 'user_id': TEST_USER_ID})
+    injected = 'https://pub-fake.r2.dev/uploads/someone-else/source.wav'
+
+    res = client.post(f'{prefix}/analyze', json={'file_id': f'with-artifact{prefix}', 'artifact_url': injected})
+    assert res.status_code == 200
+    assert tasks == [(f'with-artifact{prefix}', stored)]
+
+    res = client.post(f'{prefix}/analyze', json={'file_id': f'no-artifact{prefix}', 'artifact_url': injected})
+    assert res.status_code == 422
+    assert res.json()['error_code'] == 'analyze_missing_artifact'
+    assert len(tasks) == 1
+
+
+def test_analyze_request_artifact_url_is_deprecated():
+    schema = client.get('/openapi.json').json()['components']['schemas']['AnalyzeRequest']
+    assert schema['properties']['artifact_url']['deprecated'] is True
+
+
+def test_invalid_token_error_does_not_leak_exception_text(real_auth):
+    res = client.get('/api/v1/session/some-id', headers={'Authorization': 'Bearer not-a-jwt'})
+    assert res.status_code == 401
+    assert res.json() == {'detail': 'Invalid authentication token'}

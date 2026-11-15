@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class StageStatus(str, Enum):
@@ -54,7 +54,11 @@ class UploadErrorResponse(BaseModel):
 class AnalyzeRequest(BaseModel):
     file_id: str
     filename: str | None = None
-    artifact_url: str | None = None
+    artifact_url: str | None = Field(
+        default=None,
+        deprecated=True,
+        description='Ignored. The server only analyzes the audio stored for the session.',
+    )
 
 
 class AnalysisMetadata(BaseModel):
