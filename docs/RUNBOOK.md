@@ -123,9 +123,37 @@ R2_BUCKET=music-info-retrieval-research-1
 R2_ACCESS_KEY_ID=<R2_KEY>
 R2_SECRET_ACCESS_KEY=<R2_SECRET>
 SUPABASE_JWKS_URL=https://mghlumhhbjfeqvnmqrjs.supabase.co/auth/v1/.well-known/jwks.json
-CORS_ORIGIN_REGEX=^https:\/\/(.*\.)?(lovable\.app|lovableproject\.com|pages\.dev|novice-coder\.workers\.dev)$
+CORS_ORIGIN_REGEX=^https:\\/\\/(.*\\.)?(lovable\\.app|lovableproject\\.com|pages\\.dev|novice-coder\\.workers\\.dev)$
 MAX_UPLOAD_MB=100
 ALLOW_PLACEHOLDER_STEMS=0
 ```
 
 **Quote values that contain shell metacharacters.** Single-quote `CORS_ORIGIN_REGEX` on the Droplet file if you edit it by hand.
+
+---
+
+## 8. Frontend origins
+
+Production frontend (Cloudflare Workers):
+
+- `https://mirr-web.novice-coder.workers.dev`
+
+Preview / branch deployments often look like:
+
+- `https://<prefix>-mirr-web.novice-coder.workers.dev`
+
+### Backend CORS (`CORS_ORIGIN_REGEX`)
+
+Set in `/opt/mir/.env` (must be **single-quoted** so the shell does not expand backslashes):
+
+```env
+CORS_ORIGIN_REGEX='^https:\\/\\/(.*\\.)?(lovable\\.app|lovableproject\\.com|pages\\.dev|novice-coder\\.workers\\.dev)$'
+```
+
+After changing the value, restart the API container (or re-run **deploy-backend** with `sync_env: true` if the secret was updated).
+
+Default in code if unset still allows Lovable / Pages hosts; production should set the regex above so the Worker origin is included.
+
+### R2 bucket CORS
+
+Browser PUT (presigned upload) and GET (playback) require CORS on the R2 bucket. See [docs/R2_CORS.md](R2_CORS.md) for the full policy (includes production Worker, Lovable, Pages, and local Vite ports).
