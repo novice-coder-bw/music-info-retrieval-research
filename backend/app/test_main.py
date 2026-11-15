@@ -237,3 +237,84 @@ def test_ssl_default_local_vs_remote():
     e_remote = create_engine_for_url('postgresql+psycopg://u:p@aws-0-eu-west-3.pooler.supabase.com:5432/postgres')
     cparams_remote = inspect.getclosurevars(e_remote.pool._creator).nonlocals['cparams']
     assert cparams_remote['sslmode'] == 'require'
+
+
+# --- Auth audit: protected routes require JWT; only /health is public ---
+
+PROTECTED_GET = [
+    '/api/v1/session/does-not-exist',
+    '/api/session/does-not-exist',
+]
+PROTECTED_POST_JSON = [
+    ('/api/v1/uploads/presign', {'filename': 'a.wav', 'content_type': 'audio/wav', 'size_bytes': 1}),
+    ('/api/v1/uploads/complete', {'file_id': 'x', 'object_key': 'uploads/x/source.wav', 'filename': 'a.wav', 'content_type': 'audio/wav', 'size_bytes': 1}),
+    ('/api/v1/analyze', {'file_id': 'x'}),
+    ('/api/analyze', {'file_id': 'x'}),
+    ('/api/v1/separate', {'file_id': 'x'}),
+    ('/api/separate', {'file_id': 'x'}),
+]
+
+
+def test_health_is_public():
+    response = client.get('/health')
+    assert response.status_code in (200, 503)
+
+
+def test_protected_routes_require_auth():
+    """Without a Bearer token, protected routes must return 401."""
+    app.dependency_overrides.pop(get_current_user_id, None)
+    try:
+        for path in PROTECTED_GET:
+            res = client.get(path)
+            assert res.status_code == 401, f'{path} expected 401, got {res.status_code}'
+
+        for path, body in PROTECTED_POST_JSON:
+            res = client.post(path, json=body)
+            assert res.status_code == 401, f'{path} expected 401, got {res.status_code}'
+
+        res = client.post(
+            '/api/v1/upload',
+            files={'file': ('t.wav', b'RIFF', 'audio/wav')},
+        )
+        assert res.status_code == 401
+        res = client.post(
+            '/api/upload',
+            files={'file': ('t.wav', b'RIFF', 'audio/wav')},
+        )
+        assert res.status_code == 401
+    finally:
+        app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
+
+
+def test_session_ownership_403():
+    """Authenticated user cannot read another user's session."""
+    presign = client.post(
+        '/api/v1/uploads/presign',
+        json={'filename': 'own.wav', 'content_type': 'audio/wav', 'size_bytes': 8},
+    )
+    assert presign.status_code == 200
+    pdata = presign.json()
+    file_id = pdata['file_id']
+    object_key = pdata['object_key']
+    s3 = storage_module.get_s3_client()
+    s3.put_object(Bucket=os.environ['R2_BUCKET'], Key=object_key, Body=b'data1234', ContentType='audio/wav')
+    complete = client.post(
+        '/api/v1/uploads/complete',
+        json={
+            'file_id': file_id,
+            'object_key': object_key,
+            'filename': 'own.wav',
+            'content_type': 'audio/wav',
+            'size_bytes': 8,
+        },
+    )
+    assert complete.status_code == 200
+
+    app.dependency_overrides[get_current_user_id] = lambda: 'other-user'
+    try:
+        res = client.get(f'/api/v1/session/{file_id}')
+        assert res.status_code == 403
+        res_legacy = client.get(f'/api/session/{file_id}')
+        assert res_legacy.status_code == 403
+    finally:
+        app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
