@@ -30,7 +30,7 @@ Browser (mirr-web, Cloudflare Workers)
 1. Frontend signs in with Supabase Auth; every API call sends `Authorization: Bearer <access token>`.
 2. `POST /api/v1/uploads/presign` validates type/size, records an upload intent, returns a presigned R2 PUT URL.
 3. Browser uploads straight to R2 (bucket CORS must allow the frontend origin; see `docs/R2_CORS.md`).
-4. `POST /api/v1/uploads/complete` verifies the object in R2, creates the session, enqueues analysis.
+4. `POST /api/v1/uploads/complete` requires the caller's upload intent from step 2 (404 without one, 403 if another user's, 409 if already completed), verifies the object in R2, creates the session, enqueues analysis.
 5. Celery runs analysis; stages update in Postgres.
 6. `POST /api/v1/separate` enqueues Demucs; stems land in R2 and on the session.
 7. Frontend polls `GET /api/v1/session/{file_id}`.
@@ -102,7 +102,7 @@ TanStack + Vite on Cloudflare Workers; also edited with Lovable. API contract is
 ## Known limitations
 
 - Worker memory limit in compose is 8 GB; a small Droplet can OOM on real Demucs runs until resized.
-- Ownership checks still fail-open for legacy rows with `user_id` NULL (see earlier notes); new code must fail closed.
+- Sessions with `user_id` NULL (created before auth) are owned by nobody and return 403; backfill `user_id` in the database to give a user access again.
 - Backups are manual on free Supabase.
 - Legacy `frontend/` tree is unused.
 

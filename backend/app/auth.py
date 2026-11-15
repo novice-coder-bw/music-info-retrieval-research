@@ -62,6 +62,6 @@ def get_current_user_id(credentials: Optional[HTTPAuthorizationCredentials] = De
         logger.warning('JWT validation error: %s', exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f'Invalid authentication token: {exc}',
+            detail='Invalid authentication token',
             headers={'WWW-Authenticate': 'Bearer'},
         ) from exc
